@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.cache/
+.local/
+coverage/
+test-results/
+playwright-report/
+komari.local.json
+.env
+.env.*
+!.env.example
+*.log
+*.zip
+SHA256SUMS
