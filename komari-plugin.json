@@ -3,7 +3,7 @@
   "short": "komari-gfw",
   "description": { "zh_CN": "跨境 TCP 连通性告警与双向严格检测", "en": "Cross-border TCP reachability alerts with optional reverse probes" },
   "author": "Connor",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "url": "https://github.com/Connor3773/Komari_GFW",
   "komari": "1.6.1",
   "entry": "script.js",
@@ -14,8 +14,13 @@
     "timeout": 60,
     "maxHTTPBodyBytes": 8388608
   },
+  "configuration": {
+    "type": "managed",
+    "data": [
+      { "type": "textbox", "name": "<iframe title=\"GFW 配置\" src=\"/api/admin/plugin/komari-gfw/pages/settings.html\" sandbox=\"allow-forms allow-modals allow-same-origin allow-scripts\" style=\"display:block;width:100%;height:calc(100vh - 240px);min-height:560px;border:0;border-radius:10px\"></iframe>" }
+    ]
+  },
   "pages": [
-    { "file": "pages/overview.html", "title": { "zh_CN": "GFW 总览", "en": "GFW Overview" }, "type": "iframe", "visibility": "admin" },
-    { "file": "pages/settings.html", "title": { "zh_CN": "GFW 配置", "en": "GFW Settings" }, "type": "iframe", "visibility": "admin" }
+    { "file": "pages/overview.html", "title": { "zh_CN": "GFW 总览", "en": "GFW Overview" }, "type": "iframe", "visibility": "admin" }
   ]
 }

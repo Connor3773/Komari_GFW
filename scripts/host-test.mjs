@@ -44,6 +44,13 @@ async function rpc(method, params) {
   return (await json("/api/rpc2", { jsonrpc: "2.0", method, params: params ?? {}, id: 1 })).result;
 }
 async function plugin(path, body) { return json("/api/admin/plugins/komari-gfw/" + path, body); }
+async function install(zip) {
+  const upload = await json("/api/admin/upload/init", { purpose: "plugin", filename: "komari-gfw.zip", size: zip.length });
+  const form = new FormData(); form.set("upload_id", upload.data.upload_id); form.set("chunk_index", "0"); form.set("chunk_data", new Blob([zip]), "chunk.zip");
+  const chunk = await fetch(base + "/api/admin/upload/chunk", { method: "POST", headers: { Cookie: cookie }, body: form }); assert.equal(chunk.status, 200);
+  await json("/api/admin/upload/merge", { upload_id: upload.data.upload_id });
+  await rpc("admin:setPluginEnabled", { short: "komari-gfw", enabled: true, approved: true });
+}
 async function ping(port) {
   return new Promise(resolveResult => {
     const start = Date.now();
@@ -66,12 +73,9 @@ try {
   const login = await json("/api/login", { username: "test-admin", password }, false);
   cookie = "session_token=" + login.data["set-cookie"].session_token;
   console.log("PASS: isolated Komari 1.6.1 bootstrap and authentication");
-  const zip = await readFile("dist/komari-gfw-0.1.0.zip");
-  const upload = await json("/api/admin/upload/init", { purpose: "plugin", filename: "komari-gfw.zip", size: zip.length });
-  const form = new FormData(); form.set("upload_id", upload.data.upload_id); form.set("chunk_index", "0"); form.set("chunk_data", new Blob([zip]), "chunk.zip");
-  const chunk = await fetch(base + "/api/admin/upload/chunk", { method: "POST", headers: { Cookie: cookie }, body: form }); assert.equal(chunk.status, 200);
-  await json("/api/admin/upload/merge", { upload_id: upload.data.upload_id });
-  await rpc("admin:setPluginEnabled", { short: "komari-gfw", enabled: true, approved: true });
+  const manifest = JSON.parse(await readFile("komari-plugin.json", "utf8"));
+  const zip = await readFile(`dist/komari-gfw-${manifest.version}.zip`);
+  await install(process.env.KOMARI_TEST_UPGRADE_FROM ? await readFile(process.env.KOMARI_TEST_UPGRADE_FROM) : zip);
   let settings = await plugin("settings");
   assert.equal(settings.config.enabled, false);
   console.log("PASS: plugin ZIP installed and loaded in MoeJS");
@@ -91,7 +95,9 @@ try {
   });
   hook.listen(0, "127.0.0.1"); await once(hook, "listening");
   await rpc("admin:setNotificationChannelConfiguration", { id: "webhook", data: { url: `http://127.0.0.1:${hook.address().port}`, method: "POST", content_type: "application/json", body: '{"message":"{{message}}","title":"{{title}}"}' } });
-  await rpc("admin:editSettings", { notification_enabled: true, notification_method: "webhook", notification_template: "{{message}}" });
+  await rpc("admin:editSettings", { eula_accepted: true, notification_enabled: true, notification_method: "webhook", notification_template: "{{message}}" });
+  // First-run tours force the mobile sidebar open; this disposable host tests plugin UI instead.
+  await json("/api/admin/theme/settings?theme=default", { _komari_onboarding_v1: { seen: ["install", "workbench", "notifications", "markets", "terminal"], workbenchOpened: true } });
   await plugin("test-notification", {});
   assert.equal(pluginMessages().length, 1);
   const ports = [];
@@ -146,35 +152,80 @@ try {
   assert.equal(pluginMessages().length, 3);
   await cycle();
   console.log("PASS: unload pause, reload persistence and notification deduplication");
+  if (process.env.KOMARI_TEST_UPGRADE_FROM) {
+    const before = await plugin("settings");
+    const beforeTasks = await rpc("admin:getAllPingTasks");
+    await install(zip);
+    assert.deepEqual((await plugin("settings")).config, before.config);
+    assert.equal((await plugin("overview")).events.length, 2);
+    assert.equal(pluginMessages().length, 3);
+    assert.deepEqual((await rpc("admin:getAllPingTasks")).map(t => t.id).sort(), beforeTasks.map(t => t.id).sort());
+    await cycle();
+    console.log("PASS: upgrade retains configuration, notification history and task identities");
+  }
+  const installed = (await rpc("admin:listPlugins")).find(p => p.short === manifest.short);
+  assert.equal(installed.version, manifest.version);
+  assert.deepEqual(installed.pages.map(p => p.file), ["pages/overview.html"]);
+  const declaration = await rpc("admin:getPluginConfiguration", { short: manifest.short });
+  assert.equal(declaration.configuration.data[0].type, "textbox");
+  assert.ok(declaration.configuration.data[0].name.includes("pages/settings.html"));
   browser = await chromium.launch({ channel: "msedge", headless: true });
   const context = await browser.newContext({ viewport: { width: 1400, height: 1000 }, locale: "zh-CN" });
   await context.addCookies([{ name: "session_token", value: cookie.split("=")[1], url: base }]);
+  const errors = []; context.on("page", p => p.on("pageerror", error => errors.push(error.message)));
   const page = await context.newPage();
-  const errors = []; page.on("pageerror", error => errors.push(error.message));
-  const pages = base + "/api/admin/plugin/komari-gfw/pages/";
-  await page.goto(pages + "overview.html");
-  await page.getByRole("heading", { name: "跨境连通性", exact: true }).waitFor();
-  await page.getByRole("cell", { name: /Test overseas/ }).waitFor();
-  assert.ok(!(await page.locator("body").innerText()).includes("203.0.113.25"));
+  const overviewPath = "/admin/plugin-page?short=komari-gfw&file=pages%2Foverview.html";
+  await page.goto(base + overviewPath);
+  const overviewFrame = page.frameLocator("iframe.km-plugin-frame");
+  await overviewFrame.getByRole("heading", { name: "跨境连通性", exact: true }).waitFor();
+  await overviewFrame.getByRole("cell", { name: /Test overseas/ }).waitFor();
+  assert.ok(!(await overviewFrame.locator("body").innerText()).includes("203.0.113.25"));
   await page.screenshot({ path: join(root, "overview-desktop.png"), fullPage: true });
-  await page.getByRole("link", { name: "配置", exact: true }).click();
-  await page.locator("#settings-fields").waitFor();
-  await waitFor(async () => !(await page.locator("#settings-fields").isDisabled()), "Settings enabled");
-  assert.equal(await page.locator("#strict").isChecked(), true);
-  await page.locator("#enabled").uncheck();
-  await page.getByRole("button", { name: "保存配置", exact: true }).click();
-  await page.getByText("配置已保存，探测任务已同步。", { exact: true }).waitFor();
+  const [configPage] = await Promise.all([
+    context.waitForEvent("page"),
+    overviewFrame.getByRole("link", { name: "配置", exact: true }).click(),
+  ]);
+  await configPage.bringToFront();
+  await configPage.waitForURL(base + "/admin/plugins/config?short=komari-gfw");
+  const configFrame = configPage.frameLocator('iframe[title="GFW 配置"]');
+  await configFrame.locator("#settings-fields").waitFor();
+  await waitFor(async () => !(await configFrame.locator("#settings-fields").isDisabled()), "Settings enabled");
+  assert.equal(await configFrame.locator("#strict").isChecked(), true);
+  assert.equal(await configPage.getByRole("button", { name: /保存并重载|Save and reload/i }).isVisible(), false);
+  await configFrame.locator("#enabled").uncheck();
+  await configFrame.getByRole("button", { name: "保存配置", exact: true }).click();
+  await configFrame.getByText("配置已保存，探测任务已同步。", { exact: true }).waitFor();
   assert.equal((await plugin("settings")).config.enabled, false);
-  await page.screenshot({ path: join(root, "settings-desktop.png"), fullPage: true });
-  await page.setViewportSize({ width: 390, height: 844 });
-  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
-  await page.screenshot({ path: join(root, "settings-mobile.png"), fullPage: true });
-  await page.getByRole("link", { name: "总览", exact: true }).click();
-  await page.getByRole("heading", { name: "跨境连通性", exact: true }).waitFor();
-  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
-  await page.screenshot({ path: join(root, "overview-mobile.png"), fullPage: true });
+  await configPage.reload();
+  await configFrame.locator("#settings-fields").waitFor();
+  await waitFor(async () => !(await configFrame.locator("#settings-fields").isDisabled()), "Reloaded settings");
+  assert.equal(await configFrame.locator("#enabled").isChecked(), false);
+  await configPage.screenshot({ path: join(root, "settings-desktop.png"), fullPage: true });
+  await configPage.setViewportSize({ width: 390, height: 844 });
+  const menuCollapsed = () => configPage.locator(".km-admin-panel-nav").evaluate(el => Number(getComputedStyle(el).opacity) < 0.01);
+  async function closeMobileMenu() {
+    await waitFor(() => configPage.locator(".km-admin-panel-nav").evaluate(el => getComputedStyle(el).position === "absolute"), "Mobile navigation active");
+    if (!await menuCollapsed()) {
+      try { await configPage.locator(".km-admin-panel-nav button[aria-label]").first().click({ timeout: 5000 }); }
+      catch (error) { if (!await menuCollapsed()) throw error; }
+    }
+    await waitFor(menuCollapsed, "Mobile menu closed");
+  }
+  await closeMobileMenu();
+  assert.equal(await configPage.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+  assert.equal(await configFrame.locator("html").evaluate(el => el.scrollWidth <= el.clientWidth), true);
+  await configPage.screenshot({ path: join(root, "settings-mobile.png"), fullPage: true });
+  await configPage.locator("nav button[aria-label]").first().click();
+  await configPage.getByRole("link", { name: "GFW 总览", exact: true }).click();
+  await configPage.waitForURL(base + overviewPath);
+  await closeMobileMenu();
+  const mobileOverview = configPage.frameLocator("iframe.km-plugin-frame");
+  await mobileOverview.getByRole("heading", { name: "跨境连通性", exact: true }).waitFor();
+  assert.equal(await configPage.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+  assert.equal(await mobileOverview.locator("html").evaluate(el => el.scrollWidth <= el.clientWidth), true);
+  await configPage.screenshot({ path: join(root, "overview-mobile.png"), fullPage: true });
   assert.deepEqual(errors, []);
-  console.log("PASS: real-host admin pages, config save, desktop/mobile overflow and browser errors");
+  console.log("PASS: native admin config entry, sandboxed overview navigation, config save/reload and desktop/mobile UI");
   await plugin("cleanup", { confirm: "DELETE_PLUGIN_TASKS" });
   assert.equal((await rpc("admin:getAllPingTasks") ?? []).length, 0);
   console.log("PASS: owned-task cleanup");

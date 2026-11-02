@@ -50,7 +50,13 @@ Komari Ping 任务 ------ 已有 Agent ------ 5 个 TCP 目标
 
 ## 页面与权限
 
-manifest 声明两个 `visibility: admin` iframe 页面，分别为“GFW 总览”和“GFW 配置”。HTTP API 显式检查 `req.context.principal.roles` 包含 `admin`，不把 `/api/admin` 前缀当作鉴权保证。写操作还要求 JSON 和专用请求头，拒绝跨站简单表单调用。
+manifest 的 `pages` 只声明“GFW 总览”（`visibility: admin`），不把配置注册成插件功能。配置声明采用 `configuration.type: managed` 的官方 `textbox` HTML 扩展点，在 `/admin/plugins/config?short=komari-gfw` 嵌入同源、管理员鉴权的 `pages/settings.html` 表单。仅有 textbox 时，Komari 1.6.1 隐藏托管字段的“保存并重载”按钮，用户使用内嵌表单的“保存配置”。
+
+这种方式保留动态服务器选择和逐服务器测试端口编辑，沿用原有 API 与双槽状态，不引入第二套配置或要求手动迁移。并非将各个字段改成 `server.getConfig()` 托管值。配置面板需要插件处于启用状态。
+
+Komari 的总览 iframe 沙箱没有顶层导航权限，因此总览中的配置链接在新标签页打开统一配置，避免将完整后台嵌套进 iframe。配置面板不尝试顶层跳转，返回总览使用后台原有的“插件功能 / GFW 总览”菜单；不修改父页面 DOM 或绕过宿主沙箱。
+
+HTTP API 显式检查 `req.context.principal.roles` 包含 `admin`，不把 `/api/admin` 前缀当作鉴权保证。写操作还要求 JSON 和专用请求头，拒绝跨站简单表单调用。
 
 权限仅申请 Node 兼容模块、系统 RPC、插件 HTTP 路由。不申请远程命令、本地子进程、任意文件、HTML 注入或监听额外端口。
 
@@ -69,3 +75,6 @@ manifest 声明两个 `visibility: admin` iframe 页面，分别为“GFW 总览
 - [通知 RPC](https://github.com/komari-monitor/komari/blob/1.6.1/web/rpc/jsonrpc/admin.notification.go)
 - [通知 Client 补全及总开关](https://github.com/komari-monitor/komari/blob/1.6.1/utils/messageSender/sender.go)
 - [插件独立持久化目录](https://github.com/komari-monitor/komari/blob/1.6.1/internal/plugin/plugin.go)
+- [托管配置与 textbox 扩展点](https://komari-monitor.github.io/komari-document/dev/managed-config)
+- [1.6.1 统一插件配置入口和保存按钮规则](https://github.com/komari-monitor/komari-web/blob/1.6.1/src/pages/admin/plugin_config.tsx)
+- [1.6.1 textbox 渲染与配置表单](https://github.com/komari-monitor/komari-web/blob/1.6.1/src/components/admin/ConfigFormTabs.tsx)

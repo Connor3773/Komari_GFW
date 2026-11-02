@@ -1,6 +1,6 @@
 {
   "name": "komari-gfw",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "description": "Bidirectional TCP reachability monitoring plugin for Komari 1.6.1",
