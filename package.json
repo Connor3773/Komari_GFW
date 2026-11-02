@@ -2,6 +2,7 @@
   "name": "komari-gfw",
   "version": "0.1.2",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "Bidirectional TCP reachability monitoring plugin for Komari 1.6.1",
   "engines": {
