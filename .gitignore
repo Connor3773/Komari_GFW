@@ -2,6 +2,7 @@ node_modules/
 dist/
 .cache/
 .local/
+data/
 coverage/
 test-results/
 playwright-report/
@@ -10,5 +11,13 @@ komari.local.json
 .env.*
 !.env.example
 *.log
+*.db
+*.db-shm
+*.db-wal
+*.sqlite*
+*.pem
+*.key
+credentials*.json
+state-*.json
 *.zip
 SHA256SUMS

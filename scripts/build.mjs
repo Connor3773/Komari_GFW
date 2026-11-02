@@ -1,0 +1,26 @@
+import { build } from "esbuild";
+import sdk from "@komari-monitor/plugin-sdk";
+import { zipSync, unzipSync, strToU8 } from "fflate";
+import { mkdir, readFile, writeFile, readdir } from "node:fs/promises";
+import { createHash } from "node:crypto";
+
+const manifest = JSON.parse(await readFile("komari-plugin.json", "utf8"));
+sdk.assertValidManifest(manifest);
+const result = await build({ entryPoints: ["src/plugin.ts"], bundle: true, write: false, format: "iife", platform: "neutral", target: "es2020", external: ["server", "fs", "path", "crypto"], legalComments: "none" });
+const files = { "komari-plugin.json": strToU8(JSON.stringify(manifest, null, 2)), "script.js": result.outputFiles[0].contents };
+const pageFiles = ["app.js", "overview.html", "settings.html", "style.css"];
+if (JSON.stringify((await readdir("pages")).sort()) !== JSON.stringify(pageFiles)) throw new Error("Unexpected page files; review the package allowlist before building");
+for (const name of pageFiles) files[`pages/${name}`] = new Uint8Array(await readFile(`pages/${name}`));
+files["README.md"] = new Uint8Array(await readFile("docs/OPERATIONS.md"));
+const zipFiles = Object.fromEntries(Object.entries(files).map(([path, content]) => [path, [content, { mtime: new Date(2026, 0, 1, 0, 0, 0) }]]));
+const archive = zipSync(zipFiles, { level: 9 });
+const roundTrip = unzipSync(archive);
+for (const file of ["komari-plugin.json", "script.js", ...manifest.pages.map(page => page.file)]) if (!roundTrip[file]) throw new Error(`Missing ${file}`);
+if (Object.keys(roundTrip).length !== 7) throw new Error("Unexpected package contents");
+await mkdir("dist", { recursive: true });
+const name = `komari-gfw-${manifest.version}.zip`;
+await writeFile(`dist/${name}`, archive);
+const hash = createHash("sha256").update(archive).digest("hex");
+await writeFile("dist/SHA256SUMS", `${hash}  ${name}\n`);
+console.log(`${name}: ${archive.length} bytes, ${Object.keys(roundTrip).length} files`);
+console.log(`SHA256 ${hash}`);

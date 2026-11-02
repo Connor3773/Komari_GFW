@@ -1,0 +1,26 @@
+{
+  "name": "komari-gfw",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Bidirectional TCP reachability monitoring plugin for Komari 1.6.1",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.ts",
+    "build": "node scripts/build.mjs",
+    "check": "npm run typecheck && npm test && npm run build",
+    "audit:public": "node scripts/audit-public.mjs",
+    "test:host": "node scripts/host-test.mjs"
+  },
+  "devDependencies": {
+    "@komari-monitor/plugin-sdk": "1.4.3",
+    "@playwright/test": "1.64.1",
+    "@types/node": "26.6.6",
+    "esbuild": "0.28.2",
+    "fflate": "0.8.3",
+    "typescript": "7.0.2"
+  }
+}

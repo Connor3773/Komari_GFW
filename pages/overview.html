@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>GFW 总览</title>
+  <link rel="stylesheet" href="./style.css">
+  <script src="./app.js" defer></script>
+</head>
+<body data-page="overview">
+  <main>
+    <header class="page-head"><div><p class="eyebrow">KOMARI / NETWORK OBSERVATORY</p><h1>跨境连通性</h1><p class="subtitle">正向探测与境内反向观测，在同一处掌握。</p></div><nav aria-label="插件导航"><a class="nav-link active" aria-current="page" href="./overview.html">总览</a><a class="nav-link" href="./settings.html">配置</a></nav></header>
+    <div id="message" class="message" role="status" hidden></div>
+    <section class="status-strip" aria-label="运行情况"><span id="mode" class="pill">正在加载</span><span id="schedule"></span><span id="last-poll" class="muted"></span><button id="refresh" class="button subtle" type="button">刷新结果</button></section>
+    <section id="stats" class="stats" aria-label="状态统计"></section>
+    <section class="panel">
+      <div class="panel-head"><div><h2>服务器状态</h2><p class="muted small">疑似被墙为连通性推断，不代表封锁原因已确证。</p></div><div class="filters"><label class="sr-only" for="search">搜索服务器</label><input id="search" type="search" placeholder="搜索名称、分组或显示 IP"><label class="sr-only" for="filter">筛选状态</label><select id="filter"><option value="all">全部状态</option><option value="alarm">未解除告警</option><option value="healthy">正常</option><option value="abnormal">异常 / 待确认</option><option value="unknown">数据不足</option></select></div></div>
+      <div class="table-wrap"><table><thead id="matrix-head"></thead><tbody id="matrix"></tbody></table></div>
+      <div id="empty" class="empty" hidden><h3>还没有监测数据</h3><p>选择服务器并开启监测后，结果会在这里汇集。</p><a class="button" href="./settings.html">配置监测</a></div>
+    </section>
+    <section class="panel"><div class="panel-head"><div><h2>状态变更与通知</h2><p id="notification-status" class="muted small"></p></div><span class="muted small">最近 100 条</span></div><div id="events" class="event-list"></div></section>
+    <footer>只使用新鲜、完整的探测结果。离线或缺失上报不视为连接失败。<span>Komari GFW 0.1.0</span></footer>
+  </main>
+</body>
+</html>

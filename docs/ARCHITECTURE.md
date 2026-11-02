@@ -26,7 +26,7 @@ Komari Ping 任务 ------ 已有 Agent ------ 5 个 TCP 目标
 
 - `admin:listClients` 获取服务器基本信息，立即投影为必要字段，不返回或存储 token。
 - `admin:addPingTask` / `admin:editPingTask` / `admin:getAllPingTasks` / `admin:deletePingTask` 管理专属 TCP 任务；`default_on` 恒为 false。
-- 首选 `public:queryMetrics` 查询最近窗口的 `ping.latency_ms`，`fill_empty: false`、`max_points: -1`，以避免将图表空值当失败。检查 `downsampled`，聚合数据不用于连续次数确认。
+- 使用 `public:queryMetrics` 查询最近 8 分钟的 `ping.latency_ms`，`fill_empty: false`、`max_points: 4000`。1.6.1 的此接口只接受正整数点数；原始窗口由查询时段决定。检查 `downsampled`，聚合数据不用于连续次数确认。
 - `common:getRecords` 在 1.6.1 内部使用 rollup 查询，不把它当作精确原始采样接口。这是深入源码核验后对初步方案的细化。
 - `admin:getSettings` 检查通知开关、渠道和模板，只保留需要的检查结果。
 - `admin:sendNotification` 发送事件。使用 `clients: []`，在 `message` 中放已经脱敏的名称/IP/状态，防止宿主按 UUID 补入完整 Client。
@@ -38,7 +38,9 @@ Komari Ping 任务 ------ 已有 Agent ------ 5 个 TCP 目标
 
 每个服务器有独立的样本游标、健康状态、连续告警/恢复计数、未解除事件和最后处理时间。5 个目标各取一个未消费的新样本，要求处于允许的时间偏差内；任何结果不得被多次消费。遇到过期、查询失败或配置变化，重置连续确认但不解除既有告警。
 
-定时器、配置保存、任务同步、通知发送通过串行执行锁避免重叠。状态和待发送事件在投递前原子写入；成功后保存投递状态。重试有退避和次数限制，历史记录有容量上限。配置变更会刷新排队消息的脱敏策略。
+定时器、配置保存、任务同步、通知发送通过串行执行锁避免重叠。状态和待发送事件在投递前写入双槽校验日志（`state-0.json` / `state-1.json`），成功后保存投递状态。序号和 SHA-256 用于选择完整的最新副本，写入中断时保留另一槽；两槽均损坏时拒绝静默重置。没有变化时跳过写盘。此方案避免本次 Windows 宿主测试遇到的沙箱 `renameSync` 无效句柄问题，不承诺断电级事务或严格 exactly-once 投递。
+
+通知失败最多尝试 5 次并指数退避，超过 24 小时不补发陈旧事件。检测配置变更取消旧待发通知并保留仍被监测服务器的告警标志；仅脱敏开关改变则按最新策略格式化待发消息。反向目标地址因服务器 IP 更新而改变时也重置采样起点，任务源签名随状态持久化。
 
 ## 任务所有权
 
@@ -54,7 +56,7 @@ manifest 声明两个 `visibility: admin` iframe 页面，分别为“GFW 总览
 
 ## 依赖与运行环境
 
-开发环境使用 Node.js 20+，宿主运行时为 MoeJS，不是完整 Node.js。避免使用 ESM 入口、浏览器 API、Node 原生扩展以及未经验证的兼容模块。入口由构建工具生成全局 `load()` 和 `unload()`。
+开发环境使用 Node.js 24+，宿主运行时为 MoeJS，不是完整 Node.js。避免使用 ESM 入口、浏览器 API、Node 原生扩展以及未经验证的兼容模块。入口由构建工具生成全局 `load()` 和 `unload()`。
 
 ## 官方依据
 

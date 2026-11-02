@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>GFW 配置</title>
+  <link rel="stylesheet" href="./style.css">
+  <script src="./app.js" defer></script>
+</head>
+<body data-page="settings">
+  <main>
+    <header class="page-head"><div><p class="eyebrow">KOMARI / MONITORING POLICY</p><h1>检测配置</h1><p class="subtitle">选择目标、监测范围与判定方式。</p></div><nav aria-label="插件导航"><a class="nav-link" href="./overview.html">总览</a><a class="nav-link active" aria-current="page" href="./settings.html">配置</a></nav></header>
+    <div id="message" class="message" role="status" hidden></div>
+    <form id="settings-form">
+      <fieldset id="settings-fields" disabled>
+        <section class="panel"><div class="panel-head"><div><h2>监测策略</h2><p class="muted small">改变检测策略会重新采样，尚未解除的告警将保留。</p></div><label class="switch"><input id="enabled" type="checkbox">启用监测</label></div><div class="form-grid">
+          <label>检测间隔（秒）<input id="interval" type="number" min="30" max="300" required></label>
+          <label>告警连续次数<input id="failure" type="number" min="1" max="10" required></label>
+          <label>恢复连续次数<input id="recovery" type="number" min="1" max="10" required></label>
+          <label>非大陆成功条件<select id="overseas"><option value="1">至少 1 个成功</option><option value="2">2 个全部成功</option></select></label>
+        </div><div class="option-row"><label class="switch"><input id="mask" type="checkbox">隐藏服务器 IPv4 后两段</label><span class="muted small">203.0.*.*，同时作用于通知和总览；IPv6 隐藏后半部分。</span></div></section>
+        <section class="panel"><div class="panel-head"><div><h2>正向探测目标</h2><p class="muted small">由受检服务器主动连接。支持 域名:端口、IPv4:端口、[IPv6]:端口。</p></div><span class="pill">3 大陆 + 2 非大陆</span></div><div id="targets" class="target-grid"></div><p class="note">域名由每台 Agent 本地解析。DNS 或目标故障也可能造成失败；默认大陆目标均位于广东，不能代表所有地区。</p></section>
+        <section class="panel"><div class="panel-head"><div><h2>严格模式</h2><p class="muted small">增加境内服务器到受检服务器的反向 TCP 探测。</p></div><label class="switch"><input id="strict" type="checkbox">双向确认</label></div><p class="note">开启后：大陆正向全失败 + 反向全失败 + 非大陆可达才告警。解除要求正向 5/5 和全部反向探针成功。缺失任何探针结果，均不作判断。</p><div id="strict-options" hidden><h3>境内反向探针</h3><p class="muted small">请自行确认这些服务器在境内且控制通道稳定。不会让服务器探测自己。</p><div id="observers" class="selection-grid"></div></div></section>
+        <section class="panel"><div class="panel-head"><div><h2>监测服务器 <span id="selected-count" class="muted"></span></h2><p class="muted small">新增服务器不会自动加入。严格模式下为每台已选服务器设置真实开放的端口。</p></div><label class="sr-only" for="client-search">搜索服务器</label><input id="client-search" type="search" placeholder="搜索名称或分组"></div><div id="clients" class="client-list"></div><p class="note">测试地址留空时使用 Komari 登记的 IPv4，无 IPv4 时使用 IPv6。插件不会启动服务或修改防火墙。</p></section>
+        <section class="panel"><div class="panel-head"><div><h2>通知与维护</h2><p id="notification-status" class="muted small"></p></div><button class="button subtle" id="test-notification" type="button">发送测试通知</button></div><p class="note">沿用系统当前通知渠道，模板必须包含 {{message}}。测试消息不包含服务器信息。</p><div class="option-row"><button class="button danger" id="cleanup" type="button">清理插件任务</button><span class="muted small">先保存关闭监测，再清理。删除本插件任务及探测历史，不影响其它任务。</span></div></section>
+        <div class="save-bar"><span id="dirty" class="muted">配置已加载</span><button id="save" class="button" type="submit">保存配置</button></div>
+      </fieldset>
+    </form>
+    <footer>配置和状态仅管理员可见。严格模式提高判断依据，但不能确证封锁原因。<span>Komari GFW 0.1.0</span></footer>
+  </main>
+</body>
+</html>

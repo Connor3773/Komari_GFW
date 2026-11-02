@@ -23,9 +23,36 @@ Komari 1.6.1 的跨境 TCP 连通性监测插件。每台选中的服务器通�
 - [开发计划与当前状态](docs/PLAN.md)
 - [验证计划](docs/TESTING.md)
 - [部署、安全与卸载](docs/OPERATIONS.md)
+- [公开前检查](docs/PUBLICATION.md)
 
 ## 当前阶段
 
-2026-11-02：需求和实现方案已建立，进入首版开发。尚未连接用户的生产实例，也未进行真实被墙场景验证。后续验证结果记录在 `docs/TESTING.md`，不以模拟测试冒充实机验收。
+2026-11-02：0.1.0 已实现基础与严格模式、总览和配置页。已在官方 Komari 1.6.1 Windows 宿主验证安装、两路反向探针、告警/恢复、系统 Webhook、持久化和界面。Agent 为合成 v2 协议客户端，TCP 使用本地回环真实连接；未连接生产实例，也未进行跨地域实测。详见 `docs/TESTING.md`。
 
 源码仓库为私有仓库；配置、API Key、服务器资料和本地测试数据不得提交。
+
+## 默认目标
+
+```text
+大陆电信  gd-ct-v4.ip.zstaticcdn.com:80
+大陆联通  gd-cu-v4.ip.zstaticcdn.com:80
+大陆移动  gd-cm-v4.ip.zstaticcdn.com:80
+非大陆    1.1.1.1:443
+非大陆    9.9.9.9:443
+```
+
+以上是可修改的默认配置，不保证目标始终可用。首次安装监测关闭；需选择服务器并保存启用。默认大陆目标同处广东，建议按实际需要修改槽位以增加地域独立性。
+
+## 构建与安装
+
+需要 Node.js 24+（测试直接执行 TypeScript），无需在 Komari 服务器上安装 Node.js。
+
+```sh
+npm ci
+npm run check
+npm run audit:public
+```
+
+构建生成 `dist/komari-gfw-0.1.0.zip` 和 `dist/SHA256SUMS`。在 Komari 插件管理上传 ZIP，批准系统 RPC / 路由权限，启用后进入“插件功能 / GFW 配置”。详细步骤见运维文档。
+
+严格模式需要选择一个或多个已接入 Komari 的境内探针，并填写每台受检服务器的测试端口；必须已有可接受连接的服务，插件不开放防火墙和端口。
