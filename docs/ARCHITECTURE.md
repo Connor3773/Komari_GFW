@@ -22,6 +22,8 @@ Komari Ping 任务 ------ 已有 Agent ------ 5 个 TCP 目标
 
 ## 宿主接口
 
+严格模式为每台受检服务器额外创建一个反向 TCP 任务，目标为该服务器的 `地址:测试端口`，clients 绑定选定的境内探针（排除受检服务器自己）。结果以 `(受检服务器 UUID, 反向任务 ID, 探针 UUID)` 归属，不与探针自身的正向监测混淆。告警状态机将 5 个正向样本与所有反向样本配对处理；任一缺失即不完整。
+
 - `admin:listClients` 获取服务器基本信息，立即投影为必要字段，不返回或存储 token。
 - `admin:addPingTask` / `admin:editPingTask` / `admin:getAllPingTasks` / `admin:deletePingTask` 管理专属 TCP 任务；`default_on` 恒为 false。
 - 首选 `public:queryMetrics` 查询最近窗口的 `ping.latency_ms`，`fill_empty: false`、`max_points: -1`，以避免将图表空值当失败。检查 `downsampled`，聚合数据不用于连续次数确认。
