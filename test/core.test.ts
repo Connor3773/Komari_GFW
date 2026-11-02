@@ -97,7 +97,7 @@ test("missing, future or badly aligned samples cannot form a round", () => {
   evaluate(s, {}, cfg, "server-a", epoch + 1000000);
   assert.equal(s.health, "unknown"); assert.equal(s.failureStreak, 0);
 });
-test("strict mode requires every reverse observer to fail and all to recover", () => {
+test("strict mode requires every mainland-to-server observer to fail and all to recover", () => {
   const cfg = { ...config(), strict: true, observers: ["probe-a", "probe-b"], failureThreshold: 1, recoveryThreshold: 1 }, s = newMonitor(epoch);
   assert.equal(round(s, cfg, 1, [-1, -1, -1, 1, 1, -1, 10]).length, 0);
   assert.equal(round(s, cfg, 2, [-1, -1, -1, 1, 1, -1, -1])[0].type, "blocked");
@@ -122,6 +122,25 @@ test("event is redacted and never asks host to hydrate Client records", () => {
   assert.deepEqual(result.clients, []);
   assert.ok(!JSON.stringify(result).includes("203.0.113.123"));
   assert.ok(result.message.includes("203.0.*.*"));
+});
+
+for (const type of ["blocked", "recovered"] as const) test(`notification title and direction evidence (${type})`, () => {
+  const recovered = type === "recovered";
+  const event = { type, at: epoch, since: epoch, mainland: recovered ? 3 : 0, overseas: 2, reverse: recovered ? 2 : 0, reverseTotal: 2 } as Notice;
+  const result = notificationEvent(event, { uuid: "server-a", name: "Test server", ipv4: "203.0.113.123", ipv6: "", group: "" }, config());
+  assert.equal(result.event, recovered ? "服务器解除被墙状态" : "服务器疑似被墙");
+  assert.ok(result.message.includes(`被墙状态：${recovered ? "已解除" : "疑似被墙"}`));
+  assert.ok(result.message.includes(`反向（受检服务器到大陆目标）：${recovered ? 3 : 0}/3 可达`));
+  assert.ok(result.message.includes("非大陆对照（受检服务器到非大陆目标）：2/2 可达"));
+  assert.ok(result.message.includes(`正向（大陆探针到受检服务器）：${recovered ? 2 : 0}/2 可达（严格模式）`));
+  assert.doesNotMatch(result.event + result.message, /GFW/);
+});
+
+test("basic notifications do not claim mainland-to-server evidence", () => {
+  const event = { type: "blocked", at: epoch, since: epoch, mainland: 0, overseas: 1, reverse: 0, reverseTotal: 0 } as Notice;
+  const result = notificationEvent(event, { uuid: "server-a", name: "Test server", ipv4: "203.0.113.123", ipv6: "", group: "" }, config());
+  assert.doesNotMatch(result.message, /正向|严格模式/);
+  assert.ok(result.message.includes("非大陆对照（受检服务器到非大陆目标）：1/2 可达"));
 });
 
 for (const strict of [false, true]) test(`exhaustive connectivity truth table (strict=${strict})`, () => {

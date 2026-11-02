@@ -69,10 +69,10 @@ async function load() {
   server.cron("@every 10s", () => {
     if (stopping || polling) return;
     polling = true;
-    exclusive(() => service.tick()).catch(() => console.error("GFW state persistence failed")).finally(() => { polling = false; });
+    exclusive(() => service.tick()).catch(() => console.error("被墙检测状态持久化失败")).finally(() => { polling = false; });
   });
   await service.tick();
-  console.log("Komari GFW loaded");
+  console.log("被墙检测已加载");
 }
 
 async function unload() {

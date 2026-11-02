@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { initialState, notificationReadiness, Service } from "../src/service.ts";
-import type { MetricSeries, PingTask, Rpc, State } from "../src/types.ts";
+import type { MetricSeries, Notice, PingTask, Rpc, State } from "../src/types.ts";
 
 function fixture() {
   let now = Date.parse("2026-01-01T00:00:00Z"), id = 0;
@@ -9,7 +9,7 @@ function fixture() {
   const calls: { method: string; params: any }[] = [];
   let metrics: MetricSeries[] = [];
   let saved: State;
-  let failNotifications = false;
+  let failNotifications = false, failRetention = false;
   const rpc = { async call(method: string, params: any) {
     calls.push({ method, params });
     if (method === "admin:listClients") return ["a", "b", "observer"].map(uuid => ({ uuid, name: uuid, ipv4: "203.0.113.20", group: "test", token: "MUST_NOT_ESCAPE" }));
@@ -20,6 +20,8 @@ function fixture() {
     if (method === "admin:deletePingTask") { for (let i = tasks.length - 1; i >= 0; i--) if (params.id.includes(tasks[i].id)) tasks.splice(i, 1); return null; }
     if (method === "public:queryMetrics") { assert.ok(params.max_points > 0); assert.equal(params.fill_empty, false); return { series: metrics }; }
     if (method === "admin:sendNotification") { if (failNotifications) throw new Error("SECRET_CHANNEL_URL"); return null; }
+    if (method === "admin:dbTables") { if (failRetention) throw new Error("SECRET_DATABASE_DSN"); return { database: "metrics", driver: "sqlite", tables: ["metric_series", "metric_rollups", "metric_resolutions"] }; }
+    if (method === "admin:dbQuery") return { database: "metrics", driver: "sqlite", columns: params.sql.includes("resolution_milli") ? ["id", "resolution_milli"] : ["id", "tags"], rows: [], truncated: false };
     throw new Error(`Unexpected ${method}`);
   } } as Rpc;
   const state = initialState("00112233445566778899aabb");
@@ -31,7 +33,7 @@ function fixture() {
       tags: { task_id: String(taskId) }, points: [{ time: new Date(now - 500 + index).toISOString(), value: key.startsWith("reverse:") ? reverse?.[key.slice(8)] ?? -1 : values[index] }],
     }));
   }
-  return { service, tasks, calls, setRound, saved: () => saved!, metrics: () => metrics, fail: () => { failNotifications = true; }, now: () => now, advance: (ms: number) => { now += ms; } };
+  return { service, tasks, calls, setRound, saved: () => saved!, metrics: () => metrics, fail: () => { failNotifications = true; }, failRetention: () => { failRetention = true; }, now: () => now, advance: (ms: number) => { now += ms; } };
 }
 
 test("notification preflight catches silent disabled/no-channel/no-message cases", () => {
@@ -40,12 +42,64 @@ test("notification preflight catches silent disabled/no-channel/no-message cases
   assert.equal(notificationReadiness({ notification_enabled: true, notification_method: "test", notification_template: "{{event}}" }).ready, false);
   assert.equal(notificationReadiness({ notification_enabled: true, notification_method: "test", notification_template: "{{message}}" }).ready, true);
 });
+
+test("obsolete strict tasks are removed without changing active or user tasks", async () => {
+  const f = fixture();
+  await f.service.saveConfig({ ...f.service.state.config, clients: ["a"], enabled: true, strict: true, observers: ["observer"], reverse: { a: { port: 443, host: "" } } }, 0);
+  const active = f.tasks.filter(t => t.name.includes(":forward:")).map(t => t.id);
+  await f.service.saveConfig({ ...f.service.state.config, strict: false }, 1);
+  assert.deepEqual(f.tasks.filter(t => t.name.includes(":forward:")).map(t => t.id), active);
+  assert.ok(!f.tasks.some(t => t.name.includes(":reverse:")));
+  assert.ok(!("reverse:a" in f.service.state.tasks));
+  assert.ok(f.tasks.some(t => t.name === "User-owned"));
+});
+
+test("history is bounded while paused; alarm state and live pending deliveries survive", async () => {
+  const f = fixture();
+  const event = (id: string, at: number, delivery: Notice["delivery"] = "sent"): Notice => ({ id, type: "blocked", at, since: at, client: "a", delivery, attempts: 0, nextAttemptAt: at, lastError: "", mainland: 0, overseas: 2, reverse: 0, reverseTotal: 0 });
+  await f.service.saveConfig({ ...f.service.state.config, clients: ["a"], enabled: true, failureThreshold: 1 }, 0);
+  f.setRound([-1, -1, -1, 1, 1]); await f.service.tick();
+  await f.service.saveConfig({ ...f.service.state.config, enabled: false }, 1);
+  f.service.state.events = [event("old", f.now() - 8 * 86400000), ...Array.from({ length: 150 }, (_, i) => event(String(i), f.now() - 1000 + i)), event("pending", f.now(), "pending")];
+  await f.service.tick();
+  assert.equal(f.saved().events.length, 101);
+  assert.equal(f.saved().events[0].id, "50");
+  assert.equal(f.saved().events.at(-1)!.delivery, "pending");
+  assert.equal(f.saved().monitors.a.alarm, true);
+  f.advance(8 * 86400000); await f.service.tick();
+  assert.equal(f.saved().events.length, 0);
+  assert.equal(f.saved().monitors.a.alarm, true);
+});
+
+test("history cleanup is hourly and does not disturb fresh detection", async () => {
+  const f = fixture();
+  await f.service.saveConfig({ ...f.service.state.config, clients: ["a"], enabled: true }, 0);
+  f.setRound([1, 1, 1, 1, 1]); await f.service.tick();
+  await f.service.tick();
+  assert.equal(f.calls.filter(c => c.method === "admin:dbTables").length, 1);
+  assert.equal(f.service.state.monitors.a.health, "healthy");
+  assert.equal(f.service.retentionError, "");
+  f.advance(3600000); await f.service.tick();
+  assert.equal(f.calls.filter(c => c.method === "admin:dbTables").length, 2);
+});
+
+test("cleanup failures are redacted and do not reset detection streaks", async () => {
+  const f = fixture(); f.failRetention();
+  await f.service.saveConfig({ ...f.service.state.config, clients: ["a"], enabled: true }, 0);
+  f.setRound([-1, -1, -1, 1, 1]); await f.service.tick();
+  assert.equal(f.service.state.monitors.a.failureStreak, 1);
+  assert.equal(f.service.lastError, "");
+  assert.ok(f.service.retentionError);
+  assert.ok(!JSON.stringify(f.service.snapshot()).includes("SECRET_DATABASE_DSN"));
+  for (let i = 0; i < 2; i++) { f.setRound([-1, -1, -1, 1, 1]); await f.service.tick(); }
+  assert.equal(f.service.state.monitors.a.alarm, true);
+});
 test("disabled initial load creates no tasks and exposes no tokens", async () => {
   const f = fixture(); await f.service.tick();
   assert.equal(f.tasks.length, 1);
   assert.ok(!JSON.stringify(f.service.settings()).includes("MUST_NOT_ESCAPE"));
 });
-test("create 5 forward tasks once, pause and cleanup only owned tasks", async () => {
+test("create 5 server-initiated tasks once, pause and cleanup only owned tasks", async () => {
   const f = fixture();
   await f.service.saveConfig({ ...f.service.state.config, enabled: true, clients: ["a"] }, 0);
   assert.equal(f.tasks.length, 6);
@@ -57,7 +111,7 @@ test("create 5 forward tasks once, pause and cleanup only owned tasks", async ()
   await f.service.cleanup();
   assert.equal(f.tasks.length, 1); assert.equal(f.tasks[0].name, "User-owned");
 });
-test("strict creates a reverse task per selected server, excludes self", async () => {
+test("strict creates a mainland-to-server task per selected server, excludes self", async () => {
   const f = fixture();
   await f.service.saveConfig({ ...f.service.state.config, clients: ["a", "b"], enabled: true, strict: true, observers: ["a", "observer"], reverse: { a: { port: 443, host: "" }, b: { port: 8443, host: "probe.example.com" } } }, 0);
   const a = f.tasks.find(t => t.name.endsWith(":reverse:a]"))!;
@@ -81,7 +135,7 @@ test("end-to-end service detects one event, persists before sending and redacts"
   assert.equal(f.saved().events[0].delivery, "sent");
   assert.equal(f.service.snapshot().rows[0].alarm, true);
 });
-test("strict reverse samples belong to the monitored server, not the observer", async () => {
+test("strict mainland-to-server samples belong to the monitored server, not the observer", async () => {
   const f = fixture();
   await f.service.saveConfig({ ...f.service.state.config, clients: ["a"], enabled: true, strict: true, observers: ["observer"], reverse: { a: { port: 443, host: "" } }, failureThreshold: 1, recoveryThreshold: 1 }, 0);
   f.setRound([-1, -1, -1, 1, 1], { a: 10 }); await f.service.tick(); assert.equal(f.service.state.events.length, 0);
@@ -102,6 +156,17 @@ test("notifications stop retrying after five attempts, no sensitive error escape
   assert.equal(f.calls.filter(c => c.method === "admin:sendNotification").length, 5);
   assert.equal(f.service.state.events[0].delivery, "failed");
   assert.ok(!JSON.stringify(f.service.snapshot()).includes("SECRET_CHANNEL"));
+});
+
+test("test notification uses the plugin display name without client information", async () => {
+  const f = fixture();
+  await f.service.testNotification();
+  const messages = f.calls.filter(c => c.method === "admin:sendNotification");
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].params.event.event, "被墙检测测试通知");
+  assert.deepEqual(messages[0].params.event.clients, []);
+  assert.match(messages[0].params.event.message, /^被墙检测通知通道测试/);
+  assert.doesNotMatch(messages[0].params.event.message, /203\.0\.|GFW/);
 });
 
 test("renamed user tasks are not reclaimed or deleted", async () => {

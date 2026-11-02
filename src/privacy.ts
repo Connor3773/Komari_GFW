@@ -33,14 +33,15 @@ export function notificationEvent(event: Notice, client: Client, config: Config)
     `服务器：${safe.name}`,
     `IP：${client.ipv4 ? safe.ipv4 : safe.ipv6 || "未登记"}`,
     `被墙状态：${blocked ? "疑似被墙" : "已解除"}`,
-    `探测结果：大陆 ${event.mainland}/3 可达，非大陆 ${event.overseas}/2 可达`,
-    ...(event.reverseTotal ? [`严格模式：反向 ${event.reverse}/${event.reverseTotal} 可达`] : []),
+    `反向（受检服务器到大陆目标）：${event.mainland}/3 可达`,
+    `非大陆对照（受检服务器到非大陆目标）：${event.overseas}/2 可达`,
+    ...(event.reverseTotal ? [`正向（大陆探针到受检服务器）：${event.reverse}/${event.reverseTotal} 可达（严格模式）`] : []),
     ...(!blocked ? [`异常持续：${Math.max(0, Math.round((event.at - event.since) / 60000))} 分钟`] : []),
     `检测时间：${new Date(event.at).toISOString()}`,
     "说明：TCP 连通性推断，不代表封锁原因已确证。",
   ];
   return {
-    event: blocked ? "GFW 疑似被墙" : "GFW 解除被墙状态",
+    event: blocked ? "服务器疑似被墙" : "服务器解除被墙状态",
     clients: [], time: new Date(event.at).toISOString(), message: lines.join("\n"), emoji: "",
   };
 }

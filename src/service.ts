@@ -3,8 +3,10 @@ import { evaluate, newMonitor, resetStreaks, staleAfter } from "./engine.ts";
 import { notificationEvent, safeClient } from "./privacy.ts";
 import type { Client, Config, MetricSeries, Monitor, Notice, NotificationStatus, PingTask, Rpc, Sample, State } from "./types.ts";
 import { UserError } from "./errors.ts";
+import { EVENT_HISTORY_LIMIT, EVENT_HISTORY_MS, prunePingHistory } from "./retention.ts";
 
 export interface Store { save(state: State): void }
+// Keep this ownership marker stable across display-name changes and upgrades.
 export const PREFIX = "[Komari GFW:";
 export function initialState(instance: string): State {
   return { schema: 1, instance, config: defaultConfig(), revision: 0, tasks: {}, sources: {}, monitors: {}, events: [] };
@@ -25,10 +27,13 @@ export class Service {
   clients: Client[] = [];
   lastError = "";
   lastPoll: number | null = null;
+  retentionError = "";
   notification: NotificationStatus = { ready: false, reason: "尚未检查通知配置", channel: "" };
   private rpc: Rpc;
   private store: Store;
   private clock: () => number;
+  private retentionAttempt = 0;
+  private metricPrefix = "metric_";
 
   constructor(state: State, rpc: Rpc, store: Store, clock = Date.now) {
     this.state = state;
@@ -37,7 +42,7 @@ export class Service {
     this.clock = clock;
   }
 
-  persist() { this.store.save(this.state); }
+  persist() { this.trimHistory(); this.store.save(this.state); }
 
   async refreshClients(): Promise<void> {
     const result = await this.rpc.call<Record<string, unknown>[] | null>("admin:listClients");
@@ -51,6 +56,7 @@ export class Service {
   async refreshNotification(): Promise<void> {
     const settings = await this.rpc.call<Record<string, unknown>>("admin:getSettings");
     this.notification = notificationReadiness(settings);
+    this.metricPrefix = typeof settings.metric_table_prefix === "string" && settings.metric_table_prefix ? settings.metric_table_prefix : "metric_";
   }
 
   private taskName(key: string): string { return `${PREFIX}${this.state.instance}:${key}]`; }
@@ -104,6 +110,11 @@ export class Service {
     }
     const pause = owned.filter(t => !used.has(t.id) && ((t.clients ?? []).length || t.default_on));
     if (pause.length) await this.rpc.call("admin:editPingTask", { tasks: pause.map(t => ({ ...t, clients: [], default_on: false })) });
+    if (active) {
+      const obsolete = owned.filter(t => !used.has(t.id));
+      if (obsolete.length) await this.rpc.call("admin:deletePingTask", { id: obsolete.map(t => t.id) });
+      this.state.tasks = Object.fromEntries(Object.entries(this.state.tasks).filter(([key]) => desired.has(key)));
+    }
     if (sourcesChanged) {
       this.resetMonitors();
       for (const event of this.state.events) if (event.delivery === "pending") {
@@ -203,13 +214,33 @@ export class Service {
       this.lastError = `${stage}失败 (${kind})，已停止连续计数；检查数据可用性、服务器选择和插件权限`;
       for (const m of Object.values(this.state.monitors)) { m.health = "unknown"; resetStreaks(m); }
       this.persist();
+    } finally {
+      await this.maintainHistory();
     }
   }
 
   private trimHistory(): void {
+    const now = this.clock();
+    for (const event of this.state.events) if (event.delivery === "pending" && now - event.at > 86400000) {
+      event.delivery = "failed";
+      event.lastError = "通知已过期，不再补发";
+    }
     const pending = this.state.events.filter(e => e.delivery === "pending");
-    const settled = this.state.events.filter(e => e.delivery !== "pending").slice(-200);
+    const settled = this.state.events.filter(e => e.delivery !== "pending" && now - e.at <= EVENT_HISTORY_MS).slice(-EVENT_HISTORY_LIMIT);
     this.state.events = [...settled, ...pending].sort((a, b) => a.at - b.at);
+  }
+
+  private async maintainHistory(): Promise<void> {
+    const now = this.clock();
+    if (now - this.retentionAttempt < 3600000 || !Object.keys(this.state.tasks).length) return;
+    this.retentionAttempt = now;
+    try {
+      const owned = new Map(Object.entries(this.state.tasks).map(([key, id]) => [id, this.taskName(key)]));
+      await prunePingHistory(this.rpc, owned, this.metricPrefix, now);
+      this.retentionError = "";
+    } catch {
+      this.retentionError = "历史清理未完成，将于一小时后重试；请检查 Komari 1.6.1 数据库接口和插件权限。检测及告警不受此清理错误影响。";
+    }
   }
 
   async deliver(): Promise<void> {
@@ -238,8 +269,8 @@ export class Service {
     await this.refreshNotification();
     if (!this.notification.ready) throw new UserError(this.notification.reason);
     await this.rpc.call("admin:sendNotification", { event: {
-      event: "GFW 测试通知", clients: [], time: new Date(this.clock()).toISOString(), emoji: "",
-      message: "Komari GFW 通知通道测试。此消息不包含服务器资料，不代表发生被墙事件。",
+      event: "被墙检测测试通知", clients: [], time: new Date(this.clock()).toISOString(), emoji: "",
+      message: "被墙检测通知通道测试。此消息不包含服务器资料，不代表发生被墙事件。",
     } });
   }
 
@@ -250,11 +281,13 @@ export class Service {
     if (id.length) await this.rpc.call("admin:deletePingTask", { id });
     this.state.tasks = {};
     this.state.sources = {};
+    this.retentionError = "";
+    this.retentionAttempt = 0;
     this.persist();
   }
 
   settings() {
-    return { config: this.state.config, revision: this.state.revision, clients: this.clients.map(c => safeClient(c, this.state.config.maskIp)), notification: this.notification, lastError: this.lastError };
+    return { config: this.state.config, revision: this.state.revision, clients: this.clients.map(c => safeClient(c, this.state.config.maskIp)), notification: this.notification, lastError: this.lastError, retentionError: this.retentionError };
   }
 
   snapshot() {
@@ -278,7 +311,7 @@ export class Service {
     return {
       now, enabled: cfg.enabled, strict: cfg.strict, intervalSeconds: cfg.intervalSeconds,
       failureThreshold: cfg.failureThreshold, recoveryThreshold: cfg.recoveryThreshold,
-      rows, targets: cfg.targets, lastPoll: this.lastPoll, lastError: this.lastError, notification: this.notification,
+      rows, targets: cfg.targets, lastPoll: this.lastPoll, lastError: this.lastError, retentionError: this.retentionError, notification: this.notification,
       events: this.state.events.slice(-100).reverse().map(e => ({ ...e, name: safeClient(this.clients.find(c => c.uuid === e.client) ?? { uuid: e.client, name: "已删除服务器", ipv4: "", ipv6: "", group: "" }, cfg.maskIp).name })),
     };
   }

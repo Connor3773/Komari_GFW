@@ -40,7 +40,7 @@ function sampleClass(sample) { return sample?.value == null ? "sample-unknown" :
 
 function renderOverview(data) {
   view = data;
-  $("mode").textContent = !data.enabled ? "监测已暂停" : data.strict ? "严格模式 · 双向检测" : "基础模式 · 正向检测";
+  $("mode").textContent = !data.enabled ? "监测已暂停" : data.strict ? "严格模式 · 双向检测" : "基础模式 · 反向检测";
   $("mode").className = "pill " + (data.enabled ? "good" : "");
   $("schedule").textContent = `每 ${data.intervalSeconds} 秒 · 告警 ${data.failureThreshold} 次 / 恢复 ${data.recoveryThreshold} 次`;
   $("last-poll").textContent = "上次采集 " + time(data.lastPoll);
@@ -48,7 +48,7 @@ function renderOverview(data) {
   const stats = [["监测服务器", data.rows.length, ""], ["未解除告警", count(r => r.alarm), "alarm"], ["正常", count(r => r.health === "healthy" && !r.alarm), "ok"], ["异常 / 待确认", count(r => !r.alarm && ["suspect", "degraded", "outage"].includes(r.health)), ""], ["数据不足 / 暂停", count(r => ["unknown", "initializing", "paused"].includes(r.health)), ""]];
   $("stats").replaceChildren(...stats.map(([label, value, cls]) => { const el = node("div", undefined, "stat " + cls); el.append(node("strong", String(value)), node("span", label)); return el; }));
   noticeStatus(data.notification);
-  if (data.lastError) showMessage(data.lastError);
+  if (data.lastError || data.retentionError) showMessage([data.lastError, data.retentionError].filter(Boolean).join(" "));
   else showMessage("");
   renderRows();
   $("events").replaceChildren(...data.events.map(event => {
@@ -76,7 +76,7 @@ function renderRows() {
     return true;
   });
   const header = node("tr");
-  for (const name of ["服务器", "当前状态", ...view.targets.map(t => t.name), ...(view.strict ? ["境内反向探针"] : []), "完整采样时间"]) header.append(node("th", name));
+  for (const name of ["服务器", "当前状态", ...view.targets.map(t => `${t.id.startsWith("cn") ? "反向" : "对照"} · ${t.name}`), ...(view.strict ? ["正向探针（大陆出发）"] : []), "完整采样时间"]) header.append(node("th", name));
   $("matrix-head").replaceChildren(header);
   $("matrix").replaceChildren(...rows.map(row => {
     const tr = node("tr");
@@ -115,7 +115,7 @@ function labelInput(text, input) { const label = node("label", text); label.appe
 function markDirty() { dirty = true; $("dirty").textContent = "有未保存的更改"; }
 function targetEditor(target, index) {
   const row = node("div", undefined, "target-row");
-  row.append(node("span", index < 3 ? `大陆 ${index + 1}` : `非大陆 ${index - 2}`));
+  row.append(node("span", index < 3 ? `反向 · 大陆 ${index + 1}` : `对照 · 非大陆 ${index - 2}`));
   const name = node("input"); name.value = target.name; name.required = true; name.maxLength = 40; name.setAttribute("aria-label", `${target.id} 目标名称`);
   const address = node("input"); address.value = target.address; address.required = true; address.maxLength = 300; address.spellcheck = false; address.setAttribute("aria-label", `${target.id} 目标地址`);
   name.addEventListener("input", () => { target.name = name.value; });
@@ -153,10 +153,16 @@ function renderServerSelection() {
     return row;
   }));
   if (!model.clients.length) $("clients").append(node("p", "Komari 中还没有可选择的服务器。", "note"));
-  $("observers").replaceChildren(...model.clients.map(client => selection(client, cfg.observers.includes(client.uuid), checked => {
-    cfg.observers = checked ? [...cfg.observers, client.uuid] : cfg.observers.filter(id => id !== client.uuid);
+  renderObserverSelection();
+}
+function renderObserverSelection() {
+  const query = $("observer-search").value.trim().toLowerCase();
+  const clients = model.clients.filter(c => `${c.name} ${c.group} ${c.ipv4} ${c.ipv6}`.toLowerCase().includes(query));
+  $("observers").replaceChildren(...clients.map(client => selection(client, model.config.observers.includes(client.uuid), checked => {
+    model.config.observers = checked ? [...model.config.observers, client.uuid] : model.config.observers.filter(id => id !== client.uuid);
     markDirty();
   })));
+  if (!clients.length) $("observers").append(node("p", "没有匹配的境内探针", "muted small"));
 }
 function renderSettings(data) {
   model = data;
@@ -167,7 +173,7 @@ function renderSettings(data) {
   renderServerSelection(); noticeStatus(data.notification);
   $("settings-fields").disabled = false;
   dirty = false; $("dirty").textContent = "所有更改已保存";
-  if (data.lastError) showMessage(data.lastError);
+  if (data.lastError || data.retentionError) showMessage([data.lastError, data.retentionError].filter(Boolean).join(" "));
 }
 
 async function action(button, callback) {
@@ -189,12 +195,16 @@ async function start() {
     $("settings-form").addEventListener("change", markDirty);
     $("strict").addEventListener("change", renderServerSelection);
     $("client-search").addEventListener("input", event => { event.stopPropagation(); renderServerSelection(); });
+    $("observer-search").addEventListener("input", event => { event.stopPropagation(); renderObserverSelection(); });
+    $("observer-search").addEventListener("change", event => event.stopPropagation());
+    for (const id of ["client-search", "observer-search"]) $(id).addEventListener("keydown", event => { if (event.key === "Enter") event.preventDefault(); });
     $("settings-form").addEventListener("submit", event => {
       event.preventDefault();
       action($("save"), async () => {
         const config = { ...model.config, enabled: $("enabled").checked, maskIp: $("mask").checked, strict: $("strict").checked, intervalSeconds: Number($("interval").value), failureThreshold: Number($("failure").value), recoveryThreshold: Number($("recovery").value), overseasRequired: Number($("overseas").value) };
         renderSettings(await api("settings", { config, revision: model.revision }));
-        showMessage(model.lastError || "配置已保存，探测任务已同步。", !model.lastError);
+        const warning = [model.lastError, model.retentionError].filter(Boolean).join(" ");
+        showMessage(warning || "配置已保存，探测任务已同步。", !warning);
       });
     });
     $("test-notification").addEventListener("click", () => action($("test-notification"), async () => { await api("test-notification", {}); showMessage("测试消息已交给系统通知渠道，请检查接收端。", true); }));

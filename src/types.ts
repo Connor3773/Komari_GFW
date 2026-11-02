@@ -1,6 +1,7 @@
 export const SLOTS = ["cn1", "cn2", "cn3", "global1", "global2"] as const;
 export type Slot = (typeof SLOTS)[number];
 export interface Target { id: Slot; name: string; address: string }
+// Legacy reverse fields mean mainland-to-server (forward) probes; retain schema 1 compatibility.
 export interface ReverseTarget { port: number; host: string }
 export interface Config {
   enabled: boolean;
