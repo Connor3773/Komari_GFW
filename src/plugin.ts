@@ -3,6 +3,7 @@ import { validateConfig } from "./config.ts";
 import { Service, initialState } from "./service.ts";
 import { UserError } from "./errors.ts";
 import { JournalStore } from "./storage.ts";
+import { PingResponseFilter, type HookServer } from "./visibility.ts";
 
 declare const __storageDir__: string;
 const fs = require("fs") as typeof import("node:fs");
@@ -10,7 +11,7 @@ const path = require("path") as typeof import("node:path");
 const crypto = require("crypto") as typeof import("node:crypto");
 interface Request { body: string; headers: Record<string, string>; context: { principal?: { roles?: string[] } } }
 interface Response { statusCode: number; setHeader(name: string, value: string): void; end(body: string): void }
-const server = require("server") as Rpc & { route(method: string, path: string, callback: (req: Request, res: Response) => Promise<void>): void; cron(expression: string, callback: () => void): void };
+const server = require("server") as Rpc & HookServer & { route(method: string, path: string, callback: (req: Request, res: Response) => Promise<void>): void; cron(expression: string, callback: () => void): void };
 let service: Service;
 let queue: Promise<unknown> = Promise.resolve();
 let stopping = false;
@@ -59,6 +60,7 @@ async function load() {
     state.sources ??= {};
   } else state = initialState(crypto.randomBytes(12).toString("hex"));
   service = new Service(state, server, store);
+  new PingResponseFilter(service.visibility, crypto.randomBytes(16).toString("hex")).register(server);
   service.persist();
   route("GET", "overview", async () => service.snapshot());
   route("GET", "settings", async () => { await service.refreshClients(); await service.refreshNotification(); return service.settings(); });

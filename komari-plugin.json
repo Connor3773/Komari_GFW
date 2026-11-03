@@ -3,14 +3,15 @@
   "short": "komari-gfw",
   "description": { "zh_CN": "基于多目标 TCP 探测检测服务器疑似被墙状态，支持双向严格模式、恢复通知、IP 脱敏和管理总览。", "en": "Detect suspected server blocking with multi-target TCP probes, bidirectional strict mode, recovery notifications, IP masking, and an admin overview." },
   "author": "Connor",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "url": "https://github.com/Connor3773/Komari_GFW",
-  "komari": "1.6.1",
+  "komari": ">=1.6.1",
   "entry": "script.js",
   "permissions": {
     "node": true,
     "allowSystemRPC": true,
     "allowRoutes": true,
+    "allowHooks": true,
     "timeout": 60,
     "maxHTTPBodyBytes": 8388608
   },

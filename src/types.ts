@@ -46,6 +46,7 @@ export interface State {
   schema: 1; instance: string; config: Config; revision: number;
   tasks: Record<string, number>; sources: Record<string, string>; monitors: Record<string, Monitor>;
   events: Notice[];
+  hiddenTaskIds?: number[];
 }
 export interface MetricSeries {
   metric_key: string; entity_id: string; tags?: Record<string, string>;

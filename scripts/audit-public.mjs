@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 
-const paths = execFileSync("git", ["ls-files", "-z"], { encoding: "utf8" }).split("\0").filter(Boolean);
+const paths = [...new Set(execFileSync("git", ["ls-files", "--cached", "--others", "--exclude-standard", "-z"], { encoding: "utf8" }).split("\0").filter(Boolean))];
 const problems = [];
 const forbiddenPath = /(^|\/)(\.local|\.cache|data|node_modules|dist|test-results|playwright-report)(\/|$)|(^|\/)(\.env(?:\..*)?|komari\.local\.json|state-[01]\.json)$|\.(?:db(?:-shm|-wal)?|sqlite3?|pem|key|log)$/i;
 const secrets = [
@@ -19,4 +19,4 @@ for (const path of paths) {
   for (const [index, pattern] of secrets.entries()) if (pattern.test(content)) problems.push(`${path}: potential credential pattern ${index + 1}`);
 }
 if (problems.length) { console.error(problems.join("\n")); process.exitCode = 1; }
-else console.log(`Public-readiness scan passed for ${paths.length} tracked files. Manual review and history review are still required.`);
+else console.log(`Public-readiness scan passed for ${paths.length} tracked/non-ignored files. Manual review and history review are still required.`);

@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { initialState, notificationReadiness, Service } from "../src/service.ts";
 import type { MetricSeries, Notice, PingTask, Rpc, State } from "../src/types.ts";
+import { filterResult, TaskVisibility } from "../src/visibility.ts";
 
 function fixture() {
   let now = Date.parse("2026-01-01T00:00:00Z"), id = 0;
@@ -35,6 +36,37 @@ function fixture() {
   }
   return { service, tasks, calls, setRound, saved: () => saved!, metrics: () => metrics, fail: () => { failNotifications = true; }, failRetention: () => { failRetention = true; }, now: () => now, advance: (ms: number) => { now += ms; } };
 }
+
+for (const strict of [false, true]) test(`visibility survives lifecycle without filtering internal RPC (strict=${strict})`, async () => {
+  const f = fixture();
+  await f.service.saveConfig({ ...f.service.state.config, clients: ["a"], enabled: true, strict, observers: ["observer"], reverse: { a: { port: 443, host: "" } }, failureThreshold: 1, recoveryThreshold: 1 }, 0);
+  const assertHidden = () => assert.deepEqual(filterResult(structuredClone(f.tasks), { kind: "tasks" }, f.service.visibility), [f.tasks[0]]);
+  assertHidden();
+  f.setRound([-1, -1, -1, 1, 1], { a: -1 }); await f.service.tick();
+  assert.equal(f.service.snapshot().rows[0].alarm, true);
+  assert.ok(f.service.snapshot().rows[0].samples.every(s => s.at !== null));
+  assertHidden();
+  const oldId = f.service.state.tasks["forward:cn1"];
+  f.tasks.splice(f.tasks.findIndex(t => t.id === oldId), 1);
+  await f.service.tick();
+  assert.notEqual(f.service.state.tasks["forward:cn1"], oldId);
+  assert.ok(f.service.visibility.has(oldId));
+  assertHidden();
+  await f.service.saveConfig({ ...f.service.state.config, enabled: false }, 1);
+  assertHidden();
+  assert.equal(f.service.snapshot().rows[0].health, "paused");
+  assert.equal(f.service.snapshot().rows[0].alarm, true);
+  const restored = new TaskVisibility(structuredClone(f.saved()));
+  for (const id of f.saved().hiddenTaskIds!) assert.ok(restored.has(id));
+  await f.service.saveConfig({ ...f.service.state.config, enabled: true }, 2);
+  f.setRound([1, 1, 1, 1, 1], { a: 1 }); await f.service.tick();
+  assert.equal(f.service.snapshot().rows[0].alarm, false);
+  assertHidden();
+  await f.service.saveConfig({ ...f.service.state.config, enabled: false }, 3);
+  await f.service.cleanup();
+  assertHidden();
+  assert.ok(f.service.visibility.has(oldId));
+});
 
 test("notification preflight catches silent disabled/no-channel/no-message cases", () => {
   assert.equal(notificationReadiness({}).ready, false);

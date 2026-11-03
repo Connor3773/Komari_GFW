@@ -6,6 +6,10 @@ import { createHash } from "node:crypto";
 
 const manifest = JSON.parse(await readFile("komari-plugin.json", "utf8"));
 sdk.assertValidManifest(manifest);
+const pkg = JSON.parse(await readFile("package.json", "utf8"));
+const lock = JSON.parse(await readFile("package-lock.json", "utf8"));
+if (pkg.version !== manifest.version || lock.version !== manifest.version || lock.packages[""].version !== manifest.version) throw new Error("Package versions differ");
+if (manifest.komari !== ">=1.6.1" || manifest.permissions.allowHooks !== true) throw new Error("Minimum Komari version / hook permission missing");
 const result = await build({ entryPoints: ["src/plugin.ts"], bundle: true, write: false, format: "iife", platform: "neutral", target: "es2020", external: ["server", "fs", "path", "crypto"], legalComments: "none" });
 const files = { "komari-plugin.json": strToU8(JSON.stringify(manifest, null, 2)), "script.js": result.outputFiles[0].contents, "LICENSE": new Uint8Array(await readFile("LICENSE")) };
 const pageFiles = ["app.js", "overview.html", "settings.html", "style.css"];

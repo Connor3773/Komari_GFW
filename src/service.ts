@@ -4,10 +4,11 @@ import { notificationEvent, safeClient } from "./privacy.ts";
 import type { Client, Config, MetricSeries, Monitor, Notice, NotificationStatus, PingTask, Rpc, Sample, State } from "./types.ts";
 import { UserError } from "./errors.ts";
 import { EVENT_HISTORY_LIMIT, EVENT_HISTORY_MS, prunePingHistory } from "./retention.ts";
+import { PREFIX, TaskVisibility } from "./visibility.ts";
 
 export interface Store { save(state: State): void }
 // Keep this ownership marker stable across display-name changes and upgrades.
-export const PREFIX = "[Komari GFW:";
+export { PREFIX } from "./visibility.ts";
 export function initialState(instance: string): State {
   return { schema: 1, instance, config: defaultConfig(), revision: 0, tasks: {}, sources: {}, monitors: {}, events: [] };
 }
@@ -28,6 +29,7 @@ export class Service {
   lastError = "";
   lastPoll: number | null = null;
   retentionError = "";
+  visibility: TaskVisibility;
   notification: NotificationStatus = { ready: false, reason: "尚未检查通知配置", channel: "" };
   private rpc: Rpc;
   private store: Store;
@@ -40,6 +42,7 @@ export class Service {
     this.rpc = rpc;
     this.store = store;
     this.clock = clock;
+    this.visibility = new TaskVisibility(state);
   }
 
   persist() { this.trimHistory(); this.store.save(this.state); }
@@ -66,6 +69,7 @@ export class Service {
     const cfg = this.state.config;
     const active = cfg.enabled && !forcePause;
     const all = await this.rpc.call<PingTask[] | null>("admin:getAllPingTasks") ?? [];
+    this.visibility.observe(all);
     const owned = all.filter(t => this.owns(t));
     const desired = new Map<string, Omit<PingTask, "id">>();
     if (active) {
@@ -96,6 +100,7 @@ export class Service {
         const result = await this.rpc.call<{ task_id: number }>("admin:addPingTask", want);
         if (!Number.isInteger(result.task_id) || result.task_id <= 0) throw new Error("创建探测任务返回无效 ID");
         task = { ...want, id: result.task_id };
+        this.visibility.observe([task]);
         sourcesChanged = true;
       } else if (task.target !== want.target || task.type !== "tcp" || task.interval !== want.interval || task.default_on || JSON.stringify([...(task.clients ?? [])].sort()) !== JSON.stringify([...want.clients].sort())) {
         await this.rpc.call("admin:editPingTask", { tasks: [{ ...task, ...want }] });
@@ -239,7 +244,7 @@ export class Service {
       await prunePingHistory(this.rpc, owned, this.metricPrefix, now);
       this.retentionError = "";
     } catch {
-      this.retentionError = "历史清理未完成，将于一小时后重试；请检查 Komari 1.6.1 数据库接口和插件权限。检测及告警不受此清理错误影响。";
+      this.retentionError = "历史清理未完成，将于一小时后重试；请检查宿主数据库接口和插件权限。检测及告警不受此清理错误影响。";
     }
   }
 
@@ -287,7 +292,7 @@ export class Service {
   }
 
   settings() {
-    return { config: this.state.config, revision: this.state.revision, clients: this.clients.map(c => safeClient(c, this.state.config.maskIp)), notification: this.notification, lastError: this.lastError, retentionError: this.retentionError };
+    return { config: this.state.config, revision: this.state.revision, clients: this.clients.map(c => safeClient(c, this.state.config.maskIp)), notification: this.notification, lastError: this.lastError, retentionError: this.retentionError, visibilityError: this.visibility.lastError };
   }
 
   snapshot() {
@@ -311,7 +316,7 @@ export class Service {
     return {
       now, enabled: cfg.enabled, strict: cfg.strict, intervalSeconds: cfg.intervalSeconds,
       failureThreshold: cfg.failureThreshold, recoveryThreshold: cfg.recoveryThreshold,
-      rows, targets: cfg.targets, lastPoll: this.lastPoll, lastError: this.lastError, retentionError: this.retentionError, notification: this.notification,
+      rows, targets: cfg.targets, lastPoll: this.lastPoll, lastError: this.lastError, retentionError: this.retentionError, visibilityError: this.visibility.lastError, notification: this.notification,
       events: this.state.events.slice(-100).reverse().map(e => ({ ...e, name: safeClient(this.clients.find(c => c.uuid === e.client) ?? { uuid: e.client, name: "已删除服务器", ipv4: "", ipv6: "", group: "" }, cfg.maskIp).name })),
     };
   }

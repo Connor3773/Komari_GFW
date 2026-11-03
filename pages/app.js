@@ -48,7 +48,7 @@ function renderOverview(data) {
   const stats = [["监测服务器", data.rows.length, ""], ["未解除告警", count(r => r.alarm), "alarm"], ["正常", count(r => r.health === "healthy" && !r.alarm), "ok"], ["异常 / 待确认", count(r => !r.alarm && ["suspect", "degraded", "outage"].includes(r.health)), ""], ["数据不足 / 暂停", count(r => ["unknown", "initializing", "paused"].includes(r.health)), ""]];
   $("stats").replaceChildren(...stats.map(([label, value, cls]) => { const el = node("div", undefined, "stat " + cls); el.append(node("strong", String(value)), node("span", label)); return el; }));
   noticeStatus(data.notification);
-  if (data.lastError || data.retentionError) showMessage([data.lastError, data.retentionError].filter(Boolean).join(" "));
+  if (data.lastError || data.retentionError || data.visibilityError) showMessage([data.lastError, data.retentionError, data.visibilityError].filter(Boolean).join(" "));
   else showMessage("");
   renderRows();
   $("events").replaceChildren(...data.events.map(event => {
@@ -173,7 +173,7 @@ function renderSettings(data) {
   renderServerSelection(); noticeStatus(data.notification);
   $("settings-fields").disabled = false;
   dirty = false; $("dirty").textContent = "所有更改已保存";
-  if (data.lastError || data.retentionError) showMessage([data.lastError, data.retentionError].filter(Boolean).join(" "));
+  if (data.lastError || data.retentionError || data.visibilityError) showMessage([data.lastError, data.retentionError, data.visibilityError].filter(Boolean).join(" "));
 }
 
 async function action(button, callback) {
@@ -203,7 +203,7 @@ async function start() {
       action($("save"), async () => {
         const config = { ...model.config, enabled: $("enabled").checked, maskIp: $("mask").checked, strict: $("strict").checked, intervalSeconds: Number($("interval").value), failureThreshold: Number($("failure").value), recoveryThreshold: Number($("recovery").value), overseasRequired: Number($("overseas").value) };
         renderSettings(await api("settings", { config, revision: model.revision }));
-        const warning = [model.lastError, model.retentionError].filter(Boolean).join(" ");
+        const warning = [model.lastError, model.retentionError, model.visibilityError].filter(Boolean).join(" ");
         showMessage(warning || "配置已保存，探测任务已同步。", !warning);
       });
     });

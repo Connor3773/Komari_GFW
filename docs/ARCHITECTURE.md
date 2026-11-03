@@ -74,7 +74,59 @@ manifest 的 `pages` 只声明“被墙检测总览”（`visibility: admin`）�
 
 HTTP API 显式检查 `req.context.principal.roles` 包含 `admin`，不把 `/api/admin` 前缀当作鉴权保证。写操作还要求 JSON 和专用请求头，拒绝跨站简单表单调用。
 
-权限仅申请 Node 兼容模块、系统 RPC、插件 HTTP 路由。不申请远程命令、本地子进程、任意文件、HTML 注入或监听额外端口。
+权限仅申请 Node 兼容模块、系统 RPC、插件 HTTP 路由和指定路径的 HTTP/WS hooks。不申请远程命令、本地子进程、任意文件、HTML 注入或监听额外端口。
+
+## 输出过滤与边界
+
+最低版本 `>=1.6.1`，实际源码与宿主验证基线为 1.6.1（`96cf0f79d8cfdf6cc8be54fd1976bbc026d58f7f`）。所用 HTTP/WS hook 能力在该版本已存在，无需提高最低版本，也不对更高版本设置拒绝运行的条件。未来 API/数据库变化按响应结构检测，不宣称所有未来版本已经验证。
+
+### 覆盖范围
+
+- `GET /api/task/ping`：标准 REST 包装的任务列表。
+- `GET /api/records/ping`：任务摘要、记录、`count` 和跨任务 `basic_info`。
+- `POST /api/rpc2`：精确识别 `public:getPublicPingTasks`、`public:getPingRecords`、`public:queryMetrics` 的 `ping.*` 查询、`public:getPingMetricStats`、`common:getRecords` 的 `type: ping` 及 `common:getNodesLatestStatus` 的 `ping` 字典。
+- `GET /api/rpc2` 的 WebSocket：独立 `wsMessage` / `wsSend` / `wsClose`，覆盖文本和二进制 JSON 帧。HTTP hook 不拦截升级请求。
+- 源码核查 `/api/clients` WS、`public:getNodesInformation`、`public:getClientRecentRecords`、`public:getRecordsByUUID`、`common:getNodes`、`common:getNodeRecentStatus` 和指标定义列表：不输出逐任务 Ping 数据，无需全局扫描这些响应。
+- 不拦截 Agent v2 的调度/上报，不拦截 `admin:getAllPingTasks`、管理员数据库/备份及本插件配置/总览。其它插件若以公开自有路由转发 `server.call()` 原始数据，无法由这组限定路径钩子保证隐藏。
+
+HTTP 响应 hook 中 `req.body` 恒为空，不能据响应形状猜 RPC 方法。请求 hook 只对上述方法生成唯一临时 wire ID，保留原 ID 与过滤种类；响应精确关联后恢复 ID。批量请求混合方法、相同原始 ID、乱序回复、单元素批量返回对象、数字/字符串/null/无 ID 均有测试。保留宿主错误，不改变其它方法结果；无关 HTTP RPC 不解析其响应。HTTP 临时关联用被覆盖的内部请求头定位，不信任客户端提供的该头；不保存 Cookie、正文或凭据。
+
+字段名按 Go 的大小写/Unicode 折叠和标量 null 规则识别；精确重复 JSON 键（含转义后同名）存在 Go/JS 解析差异，RPC 请求明确拒绝，不按最后一个值猜方法。这项格式检查也适用于同入口其它方法的歧义请求，不影响正常 JSON 请求。
+
+临时 HTTP 上下文最多 256 个、120 秒淘汰，最多 1000 项批量、每次关联原 ID 文本最多 64 KiB；满载/关联丢失返回明确错误。WS 依赖 1.6.1 每连接串行读写的原生实现，每连接只保留一份关联、最多 256 个待回复连接，发送/关闭即释放。帧钩子异常会被宿主透传，因此本插件遇到本地失败会产生协议错误而不主动抛出透传异常。宿主自身超时仍不可控制。
+
+`POST /api/rpc2` 的请求 hook 会让该入口适用 manifest 的 8 MiB 请求体读取上限，包括混合批量中的其它方法；超过时宿主返回 413。普通 API 无新增全局读取限制，上传附件等独立路由不受影响。
+
+### 归属、汇总与采样
+
+`hiddenTaskIds` 是 schema 1 的可选兼容扩展，仅保存已确认本实例任务的整数 ID。0.1.2 升级从现有 `state.tasks` 引导，随后由完整实例前缀和合法槽位识别现存及同实例遗留任务。创建后立即登记，任务重建/配置变化/删除/暂停不丢弃退休 ID，以覆盖缓存或遗留记录；遇到已改名或被用户任务复用的活跃 ID 撤销隐藏。不会接管其它随机实例或仅带相似前缀的用户任务；完整私有实例标记属于保留标记，不能区分人工逐字伪造的同实例任务。
+
+无 ID 对应关系、任务已经消失且旧版从未记账、或整个实例目录丢失的孤儿记录无法可靠归属，不按猜测过滤。活跃任务改名的无名称指标响应在下一次协调前存在最多一个轮询周期的缓存延迟；任务列表/带名称的摘要可立即撤销旧归属。这些属于输出过滤的限制。
+
+1.6.1 没有这些接口的 offset/cursor 分页；`max_count` / `maxCount` 是按任务比例分配的采样上限。直接过滤采样后数据会让插件消耗用户点数预算，且不能精确修复跨任务汇总。请求 hook 仅对历史读取取消宿主的最终显示采样（不改变底层 rollup 查询窗口），响应先移除插件记录、从保留记录重算 `basic_info`，再应用调用方原上限。采用宿主的比例分配与含首尾均匀采样规则，同权余数按任务 ID 稳定排序；原宿主 Go map 的同权顺序本来不稳定。
+
+每任务统计保留宿主计算值，`count` 对应实际返回数组长度；指标移除整条内部系列（含空/填充系列）及逐点任务标签，不修改非 Ping 指标。无上限查询完整保留用户返回记录；有上限查询保留对应用户采样预算。出现未知分页、截断 count 或无法安全理解的结构，不从单页伪造总数，返回明确错误并显示 `visibilityError`，该警告在本次插件运行期间保留。
+
+过滤本身不删除任何有效探测记录。现有任务协调删除和定向历史清理逻辑保持不变；`server.call()` 直接走 RPC，不经过 HTTP/WS 钩子，内部原始采样、告警和恢复不受输出过滤影响。
+
+### 性能与无法保证的情况
+
+只为上述三个路径注册 HTTP hooks，不全局缓冲 HTTP；只为 `/api/rpc2` 注册 WS hooks，不触碰 Agent 通道。普通过滤为 O(任务数 + 记录数)，归属查找用 Set；需要下采样时排序为 O(n log n)。历史查询需完整的宿主返回结果才能修复汇总，因此临时内存和返回给钩子的记录数可能高于原本的限点查询；建议缩短大量节点的历史查询时间范围。插件不在 hook 中查询数据库/调用异步 RPC，也不把延迟数据另行存盘。
+
+**原生钩子是尽力输出改写，不是授权隔离：**
+
+- HTTP 缓冲固定 32 MiB；超限直接透传。`Flush()` 进入流式透传。宿主仅凭 `Connection: Upgrade` 与非空 `Upgrade` 头就跳过 HTTP hooks；**普通 REST 端点带升级头也能旁路，不要求实际建立 WebSocket**。隔离宿主测试对此保留反例断言，不能把它作为严格隔离已修复。`maxHTTPBodyBytes` 只约束请求读取等，不提高响应上限。
+- HTTP response hook 超时/异常继续原响应；WS 单帧超过 8 MiB 或处理超过 1 秒原样通过。由于这些是宿主主动绕过，插件不能保证拒绝或可靠上报每次旁路。超大 RPC 透传还可能携带临时 wire ID，而非原 ID。
+- 插件禁用、审批失效、卸载、启动/停止窗口、其它插件后置改写以及未来新增端点可能暴露原生数据。已缓存的旧响应不能追溯撤回；修改后的 HTTP 响应使用 `no-store` 并移除旧 ETag。
+- 管理员数据库、备份、原生任务管理与其它插件直接 RPC 仍能读取原数据，符合其特权用途，不承诺对管理员隔离。
+
+因此 0.1.3 能在已验证普通 API 场景隐藏内部数据，但**未达到无条件、所有传输/体积/运行状态下绝不暴露的目标**。不能把“前端不显示”描述为安全边界已修复。
+
+### 仅改插件的替代路线
+
+若必须让内部结果根本不进入公共 Ping 存储，可另做“已有 Agent 远程命令探测”后端：使用 1.6.1 `admin:exec` 投递固定、安全编码的 TCP 检测命令，经 `admin:getSpecificTaskResult` 读取结果，只在插件状态保存必要样本，不创建原生 Ping 任务。普通/严格模式仍由所选现有 Agent 执行，不修改核心、主题或 Agent，也不安装额外 Agent。
+
+这条路线在源码上有接口，但需要 Agent 开启远程执行、按 OS 检查可用 TCP 工具、超时/并发/任务结果清理，以及完整的跨平台验证；与现有“无需远程命令”安全和部署约定不同。0.1.3 **没有启用或实现此替代后端**，不能未经用户批准静默替换。若同时禁止远程命令且坚持原生 Ping 任务，在 1.6.1 仅改插件无法提供严格隔离；屏蔽全部公共 Ping API 会损害用户任务，也不是本项目采用的方案。
 
 ## 依赖与运行环境
 
@@ -82,7 +134,7 @@ HTTP API 显式检查 `req.context.principal.roles` 包含 `admin`，不把 `/ap
 
 ## 官方依据
 
-核验日期：2026-11-02；以下源码固定到 1.6.1，不以滚动主分支保证兼容性。
+核验日期：2026-11-03；以下源码固定到 1.6.1，不以滚动主分支保证兼容性。
 
 - [插件指南](https://komari-monitor.github.io/komari-document/dev/plugin/index)
 - [Ping RPC](https://github.com/komari-monitor/komari/blob/1.6.1/web/rpc/jsonrpc/admin.ping.go)
@@ -96,3 +148,10 @@ HTTP API 显式检查 `req.context.principal.roles` 包含 `admin`，不把 `/ap
 - [1.6.1 textbox 渲染与配置表单](https://github.com/komari-monitor/komari-web/blob/1.6.1/src/components/admin/ConfigFormTabs.tsx)
 - [1.6.1 官方数据库 RPC](https://github.com/komari-monitor/komari/blob/1.6.1/web/rpc/jsonrpc/admin.dbquery.go)
 - [1.6.1 原始内存窗口与聚合表结构](https://github.com/komari-monitor/komari/blob/1.6.1/pkg/metric/migrations.go)
+- [HTTP hook 正文与缓冲实现](https://github.com/komari-monitor/komari/blob/1.6.1/internal/plugin/hook.go)
+- [WebSocket hook 限制](https://github.com/komari-monitor/komari/blob/1.6.1/internal/plugin/wshook.go)
+- [RPC HTTP/WS 传输和批量格式](https://github.com/komari-monitor/komari/blob/1.6.1/web/rpc/jsonrpc/transport.go)
+- [公共 Ping 历史与任务](https://github.com/komari-monitor/komari/blob/1.6.1/web/rpc/jsonrpc/public.go)
+- [公共节点最新状态中的 Ping 字典](https://github.com/komari-monitor/komari/blob/1.6.1/web/rpc/jsonrpc/common.go)
+- [历史记录及跨任务汇总](https://github.com/komari-monitor/komari/blob/1.6.1/web/rpc/jsonrpc/common.record.go)
+- [远程命令替代路线接口，仅分析未启用](https://github.com/komari-monitor/komari/blob/1.6.1/web/rpc/jsonrpc/admin.system.go)

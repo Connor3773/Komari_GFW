@@ -7,6 +7,7 @@ import net from "node:net";
 import http from "node:http";
 import { once } from "node:events";
 import { chromium } from "@playwright/test";
+import { unzipSync, strFromU8 } from "fflate";
 
 // This harness creates a fresh loopback-only host and synthetic Agent identities.
 // No production URL or credential is accepted, and every TCP target is loopback.
@@ -62,7 +63,16 @@ async function install(zip) {
   const upload = await json("/api/admin/upload/init", { purpose: "plugin", filename: "komari-gfw.zip", size: zip.length });
   const form = new FormData(); form.set("upload_id", upload.data.upload_id); form.set("chunk_index", "0"); form.set("chunk_data", new Blob([zip]), "chunk.zip");
   const chunk = await fetch(base + "/api/admin/upload/chunk", { method: "POST", headers: { Cookie: cookie }, body: form }); assert.equal(chunk.status, 200);
-  await json("/api/admin/upload/merge", { upload_id: upload.data.upload_id });
+  try { await json("/api/admin/upload/merge", { upload_id: upload.data.upload_id }); }
+  catch (error) {
+    // Reinstall succeeds but native auto-reload correctly fails when permissions grow.
+    // Check the installed artifact before explicitly approving it on this test host.
+    if (!/plugin reinstalled but reload failed:.*plugin permissions require approval/.test(error.message)) throw error;
+    const expected = JSON.parse(strFromU8(unzipSync(zip)["komari-plugin.json"]));
+    const installed = (await rpc("admin:listPlugins")).find(p => p.short === expected.short);
+    assert.equal(installed?.version, expected.version);
+    console.log("PASS: permission change requires reapproval after reinstall");
+  }
   await rpc("admin:setPluginEnabled", { short: "komari-gfw", enabled: true, approved: true });
 }
 async function ping(port) {
@@ -86,7 +96,8 @@ try {
   await sleep(1500);
   const login = await json("/api/login", { username: "test-admin", password }, false);
   cookie = "session_token=" + login.data["set-cookie"].session_token;
-  console.log("PASS: isolated Komari 1.6.1 bootstrap and authentication");
+  const hostVersion = await rpc("public:getVersion");
+  console.log("PASS: isolated Komari bootstrap and authentication", JSON.stringify(hostVersion));
   const manifest = JSON.parse(await readFile("komari-plugin.json", "utf8"));
   const zip = await readFile(`dist/komari-gfw-${manifest.version}.zip`);
   await install(process.env.KOMARI_TEST_UPGRADE_FROM ? await readFile(process.env.KOMARI_TEST_UPGRADE_FROM) : zip);
@@ -230,7 +241,125 @@ try {
   assert.equal(pluginMessages().length, deliveredBeforePrune);
   await cycle();
   console.log("PASS: owned expired rollups pruned; recent/current buckets, foreign tasks and notification state preserved");
+  // Seed a non-empty latest-status Ping dictionary for the actual synthetic node.
+  for (const taskId of [tasks[0].id, userTask.task_id]) {
+    const tags = JSON.stringify({ task_id: String(taskId) });
+    const hash = createHash("sha256").update(tags).digest("hex");
+    let rows = await sqlQuery("SELECT id FROM metric_series WHERE entity_id = ? AND metric_name = ? AND tags_hash = ?", [monitored.uuid, "ping.latency_ms", hash]);
+    if (!rows.length) {
+      await sqlExec("INSERT INTO metric_series (metric_name, entity_id, tags_hash, tags) VALUES (?, ?, ?, ?)", ["ping.latency_ms", monitored.uuid, hash, tags]);
+      rows = await sqlQuery("SELECT id FROM metric_series WHERE entity_id = ? AND metric_name = ? AND tags_hash = ?", [monitored.uuid, "ping.latency_ms", hash]);
+    }
+    await insertRollup(rows[0][0], minuteId, recentBucket - 60000);
+  }
+  const report = await fetch(base + "/api/clients/v2/rpc", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", method: "agent.report", id: 1, token: monitored.token, params: { report: { cpu: { usage: 12 }, updated_at: new Date().toISOString() } } }) });
+  assert.ok(!(await report.json()).error);
+  // Reproduce the native hook bypass rather than claiming strict access isolation.
+  const bypassed = await new Promise((resolveBody, reject) => {
+    http.get(base + "/api/task/ping", { headers: { Connection: "Upgrade", Upgrade: "websocket" } }, response => {
+      let body = "";
+      response.on("data", chunk => { body += chunk; });
+      response.on("end", () => { try { resolveBody(JSON.parse(body)); } catch (e) { reject(e); } });
+      response.on("error", reject);
+    }).on("error", reject);
+  });
+  assert.ok(bypassed.data.some(t => t.name.startsWith("[Komari GFW:")));
+  console.log("VERIFIED LIMITATION: Upgrade headers bypass HTTP hooks even on the ordinary REST task endpoint");
+  async function verifyVisibility() {
+    const ownedIds = new Set((await rpc("admin:getAllPingTasks")).filter(t => t.name.startsWith("[Komari GFW:")).map(t => String(t.id)));
+    const metricParams = { metric_keys: ["ping.latency_ms", "ping.loss"], entity_ids: ["retention-fixture"], hours: 1, fill_empty: false, max_points: 4000 };
+    const requests = [
+      ["public:getPublicPingTasks", {}],
+      ["public:getPingRecords", { uuid: "retention-fixture", hours: "1", max_count: 1 }],
+      ["public:queryMetrics", metricParams],
+      ["public:getPingMetricStats", { entity_ids: ["retention-fixture"], hours: 1 }],
+      ["common:getRecords", { type: "ping", uuid: "retention-fixture", hours: 1, maxCount: 1 }],
+      ["common:getNodesLatestStatus", {}],
+      ["common:getNodesLatestStatus", { uuid: monitored.uuid }],
+    ];
+    const assertClean = (method, value) => {
+      assert.ok(!JSON.stringify(value).includes("[Komari GFW:"), method);
+      if (method === "public:getPublicPingTasks") assert.deepEqual(value.map(t => t.id), [userTask.task_id]);
+      if (method === "public:getPingRecords" || method === "common:getRecords") {
+        assert.equal(value.count, value.records.length);
+        assert.equal(value.count, 1, method);
+        assert.ok(value.records.every(r => r.task_id === userTask.task_id));
+        assert.ok(value.basic_info?.every(s => s.loss === 0 && s.min === 1 && s.max === 1));
+      }
+      if (method === "public:queryMetrics") {
+        assert.equal(value.count, value.series.length);
+        assert.ok(value.series.some(s => s.tags?.task_id === String(userTask.task_id) && s.points?.length));
+        assert.ok(value.series.every(s => !ownedIds.has(s.tags?.task_id) && (s.points ?? []).every(p => !ownedIds.has(p.tags?.task_id))));
+      }
+      if (method === "public:getPingMetricStats") {
+        assert.equal(value.count, value.stats.length);
+        assert.ok(value.stats.some(s => s.task_id === String(userTask.task_id)));
+        assert.ok(value.stats.every(s => !ownedIds.has(s.task_id)));
+      }
+      if (method === "common:getNodesLatestStatus") {
+        const node = value.client ? value : value[monitored.uuid];
+        assert.ok(node);
+        assert.equal(node.cpu, 12);
+        assert.ok(node.ping[String(userTask.task_id)]);
+        assert.ok(Object.keys(node.ping).every(id => !ownedIds.has(id)));
+      }
+    };
+    const starts = Date.now();
+    for (const authenticated of [false, true]) {
+      for (const [method, params] of requests) {
+        const response = await json("/api/rpc2", { jsonrpc: "2.0", id: "visibility", method, params }, authenticated);
+        assert.equal(response.id, "visibility");
+        assertClean(method, response.result);
+      }
+      assert.deepEqual((await json("/api/task/ping", undefined, authenticated)).data.map(t => t.id), [userTask.task_id]);
+      const history = (await json("/api/records/ping?uuid=retention-fixture&hours=1", undefined, authenticated)).data;
+      assert.ok(history.records.length > 0);
+      assert.ok(history.records.every(r => r.task_id === userTask.task_id));
+      assert.equal(history.count, history.records.length);
+    }
+    const batch = await json("/api/rpc2", [
+      { jsonrpc: "2.0", method: "public:getPublicPingTasks", id: 10 },
+      { jsonrpc: "2.0", method: "admin:getAllPingTasks", id: 10 },
+      { jsonrpc: "2.0", method: "public:getVersion", id: "version" },
+    ]);
+    assert.deepEqual(batch[0].result.map(t => t.id), [userTask.task_id]);
+    assert.ok(batch[1].result.some(t => ownedIds.has(String(t.id))));
+    assert.deepEqual(batch.map(r => r.id), [10, 10, "version"]);
+    // Use a same-origin browser client: the host correctly rejects anonymous
+    // native WebSockets without Origin. Do not weaken its Origin policy for tests.
+    const wsPage = await browser.newPage();
+    await wsPage.goto(base + "/api/version");
+    try {
+      const replies = await wsPage.evaluate(async ({ requests }) => {
+        const ws = new WebSocket(location.origin.replace("http:", "ws:") + "/api/rpc2");
+        await new Promise((resolveOpen, reject) => { ws.onopen = resolveOpen; ws.onerror = () => reject(new Error("WebSocket handshake failed")); });
+        const results = [];
+        try {
+          for (const [method, params] of requests) for (const binary of [false, true]) {
+            const response = new Promise((resolveMessage, reject) => {
+              const timer = setTimeout(() => reject(new Error("WebSocket response timeout")), 5000);
+              ws.onmessage = event => { clearTimeout(timer); resolveMessage(JSON.parse(event.data)); };
+            });
+            const wire = JSON.stringify({ jsonrpc: "2.0", id: "ws-id", method, params });
+            ws.send(binary ? new TextEncoder().encode(wire) : wire);
+            results.push({ method, message: await response });
+          }
+          return results;
+        } finally { ws.close(); }
+      }, { requests });
+      for (const { method, message } of replies) {
+        assert.equal(message.id, "ws-id");
+        assert.ok(!message.error, JSON.stringify(message.error));
+        assertClean(method, message.result);
+      }
+    } finally { await wsPage.close(); }
+    const state = await plugin("overview");
+    assert.equal(state.visibilityError, "");
+    if (state.enabled) assert.ok(state.rows[0].samples.every(s => s.at !== null));
+    console.log(`PASS: public REST, HTTP RPC mixed batches, text/binary WebSocket, user history/stats and internal samples (${Date.now() - starts} ms)`);
+  }
   browser = await chromium.launch({ channel: "msedge", headless: true });
+  await verifyVisibility();
   const context = await browser.newContext({ viewport: { width: 1400, height: 1000 }, locale: "zh-CN" });
   await context.addCookies([{ name: "session_token", value: cookie.split("=")[1], url: base }]);
   const errors = []; context.on("page", p => p.on("pageerror", error => errors.push(error.message)));
@@ -279,6 +408,7 @@ try {
   await configFrame.getByRole("button", { name: "保存配置", exact: true }).click();
   await configFrame.getByText("配置已保存，探测任务已同步。", { exact: true }).waitFor();
   assert.equal((await plugin("settings")).config.enabled, false);
+  await verifyVisibility();
   await configPage.reload();
   await configFrame.locator("#settings-fields").waitFor();
   await waitFor(async () => !(await configFrame.locator("#settings-fields").isDisabled()), "Reloaded settings");
@@ -318,10 +448,10 @@ try {
   await plugin("cleanup", { confirm: "DELETE_PLUGIN_TASKS" });
   assert.deepEqual((await rpc("admin:getAllPingTasks") ?? []).map(t => t.id), [userTask.task_id]);
   console.log("PASS: owned-task cleanup");
-  await writeFile(join(root, "host-test-result.json"), JSON.stringify({ komari: "1.6.1", plugin: manifest.version, upgradeFrom: Boolean(process.env.KOMARI_TEST_UPGRADE_FROM), passed: true, checkedAt: new Date().toISOString(), checks: ["ZIP lifecycle", "ACL/CSRF", "raw metrics", "strict 2-observer block/recovery", "Webhook title/direction/redaction", "persistence", "owned rollup retention", "observer search", "desktop/mobile UI", "cleanup"], limitation: "Synthetic v2 Agents with real loopback TCP, not production geographically distributed Agents; real retention test uses SQLite." }, null, 2));
+  await writeFile(join(root, "host-test-result.json"), JSON.stringify({ komari: hostVersion, plugin: manifest.version, upgradeFrom: Boolean(process.env.KOMARI_TEST_UPGRADE_FROM), passed: true, checkedAt: new Date().toISOString(), checks: ["ZIP lifecycle", "ACL/CSRF", "raw metrics", "strict 2-observer block/recovery", "Webhook title/direction/redaction", "persistence", "owned rollup retention", "public HTTP/WS filtering", "user history/statistics", "paused filtering", "observer search", "desktop/mobile UI", "cleanup"], limitation: "Synthetic v2 Agents with real loopback TCP, not production geographically distributed Agents; real retention test uses SQLite. Hook limits are not an authorization boundary." }, null, 2));
 } catch (error) {
   await writeFile(join(root, "host-test-error.log"), log);
-  console.error(error.stack); process.exitCode = 1;
+  console.error(error?.stack ?? String(error)); process.exitCode = 1;
 } finally {
   await browser?.close();
   for (const listener of listeners) if (listener.listening) await new Promise(r => listener.close(r));
