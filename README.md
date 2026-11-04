@@ -30,7 +30,7 @@ Komari 的服务器被墙检测插件。基于已有 Agent 的 TCP 探测，结�
 ## 安装配置
 
 1. 备份 Komari 数据，确认服务端为 **1.6.1 或兼容的更高版本**。
-2. 从 [Releases](https://github.com/Connor3773/Komari_GFW/releases/latest) 下载对应版本的插件包（0.1.3 为 `komari-gfw-0.1.3.zip`）和 `SHA256SUMS`，核对 SHA-256 后在插件管理上传 ZIP，并批准声明的权限。不要使用 GitHub 自动生成的 Source code 压缩包。
+2. 从 [Releases](https://github.com/Connor3773/Komari_GFW/releases/latest) 下载对应版本的插件包（0.1.4 为 `komari-gfw-0.1.4.zip`）和 `SHA256SUMS`，核对 SHA-256 后在插件管理上传 ZIP，并批准声明的权限。不要使用 GitHub 自动生成的 Source code 压缩包。
 3. 启用插件，打开“插件配置”，选择“被墙检测”。首次安装监测关闭。
 4. 修改目标、选择受检服务器。严格模式另选境内正向探针，并为每台受检服务器设置实际开放的测试端口。
 5. 在系统中配置通知渠道，模板包含 `{{message}}`，先发送测试通知。
@@ -38,9 +38,11 @@ Komari 的服务器被墙检测插件。基于已有 Agent 的 TCP 探测，结�
 
 配置和总览仅管理员可见，配置入口为 `/admin/plugins/config?short=komari-gfw`。境内探针可按名称、分组或显示 IP 搜索；筛选不改变已选项目。
 
-从 0.1.0 / 0.1.1 / 0.1.2 升级时直接覆盖上传，不要先卸载或清空插件存储。内部 ID `komari-gfw`、任务标识和 schema 1 保留，已有配置无需重填。0.1.3 新增 `allowHooks`，升级后必须重新批准权限并启用插件；审批前和插件禁用时过滤不生效。升级后刷新已打开的服务器详情页，已有浏览器/CDN 缓存不会被插件追溯删除。
+从 0.1.0 / 0.1.1 / 0.1.2 / 0.1.3 升级时直接覆盖上传，不要先卸载或清空插件存储。内部 ID `komari-gfw`、任务标识和 schema 1 保留，已有配置无需重填。0.1.3 新增 `allowHooks`，从更早版本升级后必须重新批准权限并启用插件；0.1.4 没有新增权限。审批前和插件禁用时过滤不生效。升级后刷新已打开的服务器详情页，已有浏览器/CDN 缓存不会被插件追溯删除。
 
-1.6.1 覆盖安装启用中的旧版时，可能提示 `plugin reinstalled but reload failed: ... permissions require approval`：这表示新包已安装但权限变化阻止了自动重载，不是配置丢失。确认版本为 0.1.3 后重新审批并启用，检查总览即可。
+1.6.1 覆盖安装启用中的旧版时，可能提示 `plugin reinstalled but reload failed: ... permissions require approval`：这表示新包已安装但权限变化阻止了自动重载，不是配置丢失。确认版本已更新后重新审批并启用，检查总览即可。
+
+0.1.4 会在成功读取完整服务器列表后自动移除已删除服务器的选择和测试端口，不把离线或列表接口错误当作删除。已选境内探针被删除时自动关闭严格模式，剩余受检服务器继续普通模式监测；不会自动恢复严格模式。受检服务器全部删除时才关闭监测总开关。现存服务器的未解除告警保留，重新采样确认；旧待发通知取消，不因删除而发送恢复通知。配置页与总览会提示自动调整，确认并保存后清除提示；若旧页面提示版本冲突，刷新后重试。
 
 ### 默认目标
 
@@ -89,7 +91,7 @@ npm run check
 npm run audit:public
 ```
 
-构建输出 `dist/komari-gfw-0.1.3.zip` 和 `dist/SHA256SUMS`。安装包仅包含 manifest、运行脚本、4 个页面资源和 MIT 许可证，不包含开发文档、测试、依赖或本地数据。
+构建输出 `dist/komari-gfw-0.1.4.zip` 和 `dist/SHA256SUMS`。安装包仅包含 manifest、运行脚本、4 个页面资源和 MIT 许可证，不包含开发文档、测试、依赖或本地数据。
 
 - [架构与宿主接口](docs/ARCHITECTURE.md)
 - [验证与复现](docs/TESTING.md)

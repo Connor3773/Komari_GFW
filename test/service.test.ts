@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { initialState, notificationReadiness, Service } from "../src/service.ts";
 import type { MetricSeries, Notice, PingTask, Rpc, State } from "../src/types.ts";
+import { validateConfig } from "../src/config.ts";
 import { filterResult, TaskVisibility } from "../src/visibility.ts";
 
 function fixture() {
@@ -10,10 +11,11 @@ function fixture() {
   const calls: { method: string; params: any }[] = [];
   let metrics: MetricSeries[] = [];
   let saved: State;
-  let failNotifications = false, failRetention = false;
+  let failNotifications = false, failRetention = false, failClients = false;
+  let clients: unknown = ["a", "b", "observer"].map(uuid => ({ uuid, name: uuid, ipv4: "203.0.113.20", group: "test", token: "MUST_NOT_ESCAPE" }));
   const rpc = { async call(method: string, params: any) {
     calls.push({ method, params });
-    if (method === "admin:listClients") return ["a", "b", "observer"].map(uuid => ({ uuid, name: uuid, ipv4: "203.0.113.20", group: "test", token: "MUST_NOT_ESCAPE" }));
+    if (method === "admin:listClients") { if (failClients) throw new Error("SECRET_CLIENT_RPC_ERROR"); return structuredClone(clients); }
     if (method === "admin:getSettings") return { notification_enabled: true, notification_method: "test", notification_template: "{{message}}" };
     if (method === "admin:getAllPingTasks") return structuredClone(tasks);
     if (method === "admin:addPingTask") { const task = { ...params, id: ++id }; tasks.push(task); return { task_id: task.id }; }
@@ -34,7 +36,7 @@ function fixture() {
       tags: { task_id: String(taskId) }, points: [{ time: new Date(now - 500 + index).toISOString(), value: key.startsWith("reverse:") ? reverse?.[key.slice(8)] ?? -1 : values[index] }],
     }));
   }
-  return { service, tasks, calls, setRound, saved: () => saved!, metrics: () => metrics, fail: () => { failNotifications = true; }, failRetention: () => { failRetention = true; }, now: () => now, advance: (ms: number) => { now += ms; } };
+  return { service, rpc, tasks, calls, setRound, saved: () => saved!, metrics: () => metrics, fail: () => { failNotifications = true; }, failRetention: () => { failRetention = true; }, failClients: () => { failClients = true; }, setClients: (value: unknown) => { clients = value; }, removeClient: (uuid: string) => { clients = (clients as { uuid: string }[]).filter(c => c.uuid !== uuid); }, now: () => now, advance: (ms: number) => { now += ms; } };
 }
 
 for (const strict of [false, true]) test(`visibility survives lifecycle without filtering internal RPC (strict=${strict})`, async () => {
@@ -152,8 +154,200 @@ test("strict creates a mainland-to-server task per selected server, excludes sel
   assert.equal(b.target, "probe.example.com:8443"); assert.deepEqual(b.clients, ["a", "observer"]);
 });
 test("conflicting revisions cannot overwrite configuration", async () => {
-  const f = fixture(); await assert.rejects(() => f.service.saveConfig(f.service.state.config, 9), /其它页面/);
+  const f = fixture(); await assert.rejects(() => f.service.saveConfig(f.service.state.config, 9), /已变化/);
   assert.equal(f.service.state.revision, 0);
+});
+
+function pending(client: string, at: number): Notice {
+  return { id: `${client}:${at}`, type: "blocked", at, since: at, client, delivery: "pending", attempts: 0, nextAttemptAt: at, lastError: "", mainland: 0, overseas: 2, reverse: 0, reverseTotal: 1 };
+}
+
+for (const strict of [false, true]) for (const enabled of [false, true]) test(`deleted monitored server is pruned and remaining monitoring recovers (strict=${strict}, enabled=${enabled})`, async () => {
+  const f = fixture();
+  await f.service.saveConfig({ ...f.service.state.config, clients: ["a", "b"], enabled: true, strict, observers: ["observer"], reverse: { a: { port: 443, host: "" }, b: { port: 80, host: "" } } }, 0);
+  if (!enabled) await f.service.saveConfig({ ...f.service.state.config, enabled: false }, f.service.state.revision);
+  const userTask = structuredClone(f.tasks[0]);
+  const removedTask = f.service.state.tasks["reverse:b"];
+  f.service.state.monitors.a.alarm = true;
+  f.service.state.monitors.a.blockedSince = f.now();
+  f.service.state.events.push(pending("b", f.now()), { ...pending("b", f.now() - 1000), delivery: "sent" });
+  f.service.lastError = "任务同步失败 (Error)";
+  f.removeClient("b");
+  await f.service.tick();
+  assert.equal(f.service.lastError, "");
+  assert.deepEqual(f.service.state.config.clients, ["a"]);
+  assert.deepEqual(Object.keys(f.service.state.config.reverse), ["a"]);
+  assert.deepEqual(Object.keys(f.service.state.monitors), ["a"]);
+  assert.equal(f.service.state.config.strict, strict);
+  assert.equal(f.service.state.config.enabled, enabled);
+  assert.equal(f.service.state.monitors.a.alarm, true);
+  assert.ok(!("reverse:b" in f.service.state.tasks));
+  assert.ok(!f.tasks.some(t => t.name.endsWith(":reverse:b]")));
+  if (strict) assert.ok(f.service.visibility.has(removedTask));
+  assert.equal(f.service.state.events.find(e => e.at === f.now())?.delivery, "superseded");
+  assert.equal(f.service.state.events.find(e => e.at < f.now())?.delivery, "sent");
+  assert.equal(f.calls.filter(c => c.method === "admin:sendNotification").length, 0);
+  assert.deepEqual(f.tasks[0], userTask);
+  assert.match(f.service.snapshot().selectionNotice, /已移除 1 台已删除的受检服务器/);
+  const revision = f.service.state.revision;
+  await f.service.tick();
+  assert.equal(f.service.state.revision, revision);
+  if (enabled) {
+    f.setRound([-1, -1, -1, 1, 1]); await f.service.tick();
+    assert.equal(f.service.state.monitors.a.failureStreak, 1);
+  } else assert.ok(f.tasks.slice(1).every(t => !t.clients.length && !t.default_on));
+  await f.service.saveConfig(f.service.state.config, revision);
+  assert.equal(f.service.settings().selectionNotice, "");
+  assert.deepEqual(validateConfig(f.saved().config), f.saved().config);
+});
+
+for (const observers of [["observer"], ["b", "observer"], ["a", "observer"]]) test(`deleted strict observer disables only strict mode (${observers.join(",")})`, async () => {
+  const f = fixture();
+  await f.service.saveConfig({ ...f.service.state.config, clients: ["a"], enabled: true, strict: true, observers, reverse: { a: { port: 443, host: "" } }, failureThreshold: 1, recoveryThreshold: 1 }, 0);
+  const forwardIds = Object.entries(f.service.state.tasks).filter(([key]) => key.startsWith("forward:")).map(([, id]) => id);
+  const oldReverse = f.service.state.tasks["reverse:a"];
+  f.service.state.monitors.a.alarm = true;
+  f.service.state.events.push(pending("a", f.now()));
+  f.removeClient("observer");
+  await f.service.tick();
+  assert.equal(f.service.lastError, "");
+  assert.equal(f.service.state.config.strict, false);
+  assert.equal(f.service.state.config.enabled, true);
+  assert.deepEqual(f.service.state.config.observers, observers.filter(id => id !== "observer"));
+  assert.equal(f.service.state.monitors.a.alarm, true);
+  assert.equal(f.service.state.events[0].delivery, "superseded");
+  assert.deepEqual(Object.values(f.service.state.tasks), forwardIds);
+  assert.ok(!f.tasks.some(t => t.id === oldReverse));
+  assert.ok(f.service.visibility.has(oldReverse));
+  assert.match(f.service.settings().selectionNotice, /严格模式已自动关闭，继续普通模式监测/);
+  f.setRound([1, 1, 1, 1, 1]); await f.service.tick();
+  assert.equal(f.service.state.monitors.a.alarm, false);
+  assert.equal(f.service.state.events.at(-1)?.type, "recovered");
+  assert.equal(f.calls.filter(c => c.method === "admin:sendNotification").length, 1);
+  const restored = new Service(structuredClone(f.saved()), f.rpc, { save() {} }, f.now);
+  await restored.tick();
+  assert.equal(restored.state.config.strict, false);
+  assert.equal(restored.state.config.enabled, true);
+  assert.equal(restored.state.events.filter(e => e.type === "recovered").length, 1);
+  assert.match(restored.snapshot().selectionNotice, /继续普通模式监测/);
+  assert.deepEqual(validateConfig(restored.state.config), restored.state.config);
+});
+
+test("deleting the final monitored server pauses tasks and never sends recovery", async () => {
+  const f = fixture();
+  await f.service.saveConfig({ ...f.service.state.config, clients: ["a"], enabled: true, strict: true, observers: ["observer"], reverse: { a: { port: 443, host: "" } } }, 0);
+  f.service.state.monitors.a.alarm = true;
+  f.service.state.events.push(pending("a", f.now()));
+  f.removeClient("a"); await f.service.tick();
+  assert.equal(f.service.state.config.enabled, false);
+  assert.deepEqual(f.service.state.config.clients, []);
+  assert.deepEqual(f.service.state.config.reverse, {});
+  assert.deepEqual(f.service.state.monitors, {});
+  assert.ok(f.tasks.slice(1).every(t => !t.clients.length && !t.default_on));
+  assert.ok(!f.tasks.some(t => t.name.endsWith(":reverse:a]")));
+  assert.equal(f.service.state.events[0].delivery, "superseded");
+  assert.equal(f.calls.filter(c => c.method === "admin:sendNotification").length, 0);
+  assert.match(f.service.settings().selectionNotice, /监测已自动关闭/);
+  await f.service.saveConfig(f.service.state.config, f.service.state.revision);
+  assert.deepEqual(validateConfig(f.saved().config), f.saved().config);
+});
+
+test("observer deletion while paused never enables monitoring and a replacement is not auto-selected", async () => {
+  const f = fixture();
+  await f.service.saveConfig({ ...f.service.state.config, clients: ["a"], enabled: true, strict: true, observers: ["observer"], reverse: { a: { port: 443, host: "" } } }, 0);
+  await f.service.saveConfig({ ...f.service.state.config, enabled: false }, f.service.state.revision);
+  const oldId = f.service.state.tasks["reverse:a"];
+  f.setClients([{ uuid: "a" }, { uuid: "replacement-probe" }]);
+  await f.service.tick();
+  assert.equal(f.service.state.config.enabled, false);
+  assert.equal(f.service.state.config.strict, false);
+  assert.deepEqual(f.service.state.config.observers, []);
+  assert.deepEqual(f.service.state.config.clients, ["a"]);
+  assert.ok(!f.tasks.some(t => t.id === oldId));
+  assert.ok(f.tasks.slice(1).every(t => !t.clients.length));
+});
+
+test("upgrade with stale persisted selections repairs on first tick", async () => {
+  const f = fixture();
+  await f.service.saveConfig({ ...f.service.state.config, clients: ["a", "b"], enabled: true, strict: true, observers: ["b", "observer"], reverse: { a: { port: 443, host: "" }, b: { port: 80, host: "" } } }, 0);
+  const oldState = structuredClone(f.saved());
+  delete oldState.selectionNotice;
+  f.removeClient("b");
+  const upgraded = new Service(oldState, f.rpc, { save() {} }, f.now);
+  await upgraded.tick();
+  assert.equal(upgraded.lastError, "");
+  assert.equal(upgraded.state.config.strict, false);
+  assert.equal(upgraded.state.config.enabled, true);
+  assert.deepEqual(upgraded.state.config.clients, ["a"]);
+  assert.deepEqual(upgraded.state.config.observers, ["observer"]);
+  assert.ok(!f.tasks.some(t => t.name.includes(":reverse:")));
+  await upgraded.saveConfig(upgraded.state.config, upgraded.state.revision);
+  assert.equal(upgraded.lastError, "");
+});
+
+test("saving a form opened before deletion prunes IDs before port validation and keeps edits", async () => {
+  const f = fixture();
+  await f.service.saveConfig({ ...f.service.state.config, clients: ["a", "b"], enabled: true, strict: true, observers: ["observer"], reverse: { a: { port: 443, host: "" }, b: { port: 80, host: "" } } }, 0);
+  const form = structuredClone(f.service.settings());
+  delete form.config.reverse.b;
+  form.config.maskIp = false;
+  f.removeClient("b"); f.removeClient("observer");
+  await f.service.saveConfig(form.config, form.revision);
+  assert.equal(f.service.state.config.maskIp, false);
+  assert.equal(f.service.state.config.enabled, true);
+  assert.equal(f.service.state.config.strict, false);
+  assert.deepEqual(f.service.state.config.clients, ["a"]);
+  assert.deepEqual(f.service.state.config.observers, []);
+  assert.deepEqual(Object.keys(f.service.state.config.reverse), ["a"]);
+  assert.equal(f.service.lastError, "");
+  assert.match(f.service.settings().selectionNotice, /严格模式已自动关闭/);
+});
+
+test("automatic pruning invalidates old forms without losing concurrent user configuration", async () => {
+  const f = fixture();
+  await f.service.saveConfig({ ...f.service.state.config, clients: ["a", "b"], enabled: true }, 0);
+  const form = structuredClone(f.service.settings());
+  f.removeClient("b"); await f.service.refreshClients();
+  assert.deepEqual(f.service.settings().config.clients, ["a"]);
+  await assert.rejects(() => f.service.saveConfig(form.config, form.revision), /配置或服务器列表已变化/);
+  assert.deepEqual(f.service.state.config.clients, ["a"]);
+});
+
+for (const response of [undefined, {}, { data: [] }, [null], [{}], [{ uuid: "a" }, { uuid: 1 }], [{ uuid: "a" }, { uuid: "a" }], [{ uuid: "invalid/uuid" }]]) test(`invalid client list cannot prune selections (${JSON.stringify(response)})`, async () => {
+  const f = fixture();
+  await f.service.saveConfig({ ...f.service.state.config, clients: ["a"], enabled: true }, 0);
+  const before = structuredClone(f.service.state.config), tasks = structuredClone(f.tasks), revision = f.service.state.revision;
+  f.setClients(response); await f.service.tick();
+  assert.match(f.service.lastError, /服务器列表失败/);
+  assert.deepEqual(f.service.state.config, before);
+  assert.equal(f.service.state.revision, revision);
+  assert.deepEqual(f.tasks, tasks);
+  assert.equal(f.service.settings().selectionNotice, "");
+});
+
+test("list RPC failure and offline clients are not deletion evidence", async () => {
+  const f = fixture();
+  await f.service.saveConfig({ ...f.service.state.config, clients: ["a"], enabled: true }, 0);
+  f.setClients([{ uuid: "a", name: "Offline", online: false }]);
+  await f.service.tick();
+  assert.deepEqual(f.service.state.config.clients, ["a"]);
+  const before = structuredClone(f.service.state.config);
+  f.failClients(); await f.service.tick();
+  assert.deepEqual(f.service.state.config, before);
+  assert.equal(f.service.state.config.enabled, true);
+  assert.doesNotMatch(JSON.stringify(f.service.snapshot()), /SECRET_CLIENT_RPC_ERROR/);
+});
+
+for (const response of [[], null]) test(`confirmed empty list clears deleted selections (${JSON.stringify(response)})`, async () => {
+  const f = fixture();
+  await f.service.saveConfig({ ...f.service.state.config, clients: ["a"], enabled: true, strict: true, observers: ["observer"], reverse: { a: { port: 443, host: "" } } }, 0);
+  f.setClients(response); await f.service.tick();
+  assert.equal(f.service.lastError, "");
+  assert.deepEqual(f.service.state.config.clients, []);
+  assert.deepEqual(f.service.state.config.observers, []);
+  assert.equal(f.service.state.config.enabled, false);
+  assert.equal(f.service.state.config.strict, false);
+  assert.deepEqual(validateConfig(f.saved().config), f.saved().config);
 });
 test("end-to-end service detects one event, persists before sending and redacts", async () => {
   const f = fixture();

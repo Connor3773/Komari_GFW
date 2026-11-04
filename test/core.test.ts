@@ -43,6 +43,19 @@ test("strict config requires a different observer and test ports", () => {
   assert.equal(reverseAddress(cfg, { uuid: "server-a", name: "A", ipv4: "203.0.113.1", ipv6: "", group: "" }), "203.0.113.1:443");
 });
 test("cannot enable empty server selection", () => assert.throws(() => validateConfig({ ...defaultConfig(), enabled: true })));
+test("live inventory removes stale selections before strict port validation without mutating input", () => {
+  const raw = { ...config(), clients: ["server-a", "deleted"], strict: true, observers: ["deleted-probe"], reverse: { "server-a": { port: 443, host: "" }, deleted: { port: 0, host: "" } } };
+  const copy = structuredClone(raw);
+  const cfg = validateConfig(raw, new Set(["server-a", "new-server"]));
+  assert.equal(cfg.enabled, true);
+  assert.equal(cfg.strict, false);
+  assert.deepEqual(cfg.clients, ["server-a"]);
+  assert.deepEqual(cfg.observers, []);
+  assert.deepEqual(Object.keys(cfg.reverse), ["server-a"]);
+  assert.deepEqual(raw, copy);
+  assert.throws(() => validateConfig({ ...raw, clients: "invalid" }, new Set()), /服务器列表无效/);
+  assert.throws(() => validateConfig({ ...defaultConfig(), enabled: true }, new Set()), /选择服务器/);
+});
 test("mask exactly the final two IPv4 octets", () => {
   assert.equal(maskAddress("203.0.113.123", true), "203.0.*.*");
   assert.equal(maskAddress("203.0.113.123", false), "203.0.113.123");

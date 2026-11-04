@@ -42,6 +42,12 @@ Komari Ping 任务 ------ 已有 Agent ------ 5 个 TCP 目标
 
 通知失败最多尝试 5 次并指数退避，超过 24 小时不补发陈旧事件。检测配置变更取消旧待发通知并保留仍被监测服务器的告警标志；仅脱敏开关改变则按最新策略格式化待发消息。正向目标地址因服务器 IP 更新而改变时也重置采样起点，任务源签名随状态持久化。
 
+0.1.4 根据 `admin:listClients` 的完整成功结果清理删除引用。整批校验记录类型、UUID 和重复项后才更新列表；接口错误或未知结构不修改选择，离线节点仍在列表中也不移除。受检列表、探针列表、逐服务器测试端口与监测状态同步裁剪，schema 1 仅增加可选 `selectionNotice` 提示。自动调整提升配置修订号并持久化，防止旧页面覆盖；保存时也会用最新列表先裁剪失效 ID，再校验严格模式端口，不让已删除且不可见的项目阻塞保存。
+
+按用户要求，只要已选境内探针被删除就关闭严格模式，不关闭仍有受检服务器的监测总开关；即使尚有其它探针，也不静默改成较少探针的严格模式。正常模式继续使用五个主动目标。所有受检服务器删除时自动关闭监测；原本暂停的监测不会被自动开启，新服务器也不自动加入。此配置变更重新开始连续确认、保留现存服务器的告警标记，并取消旧待发通知；删除本身不产生恢复事件。已处理历史仍按既有期限保留。
+
+协调器更新共享主动任务的服务器集合；已删除目标或已关闭严格模式的专属正向任务在暂停时也可回收，原始任务 ID 的隐藏证据仍保留。用户任务与其它实例不修改。读取设置时会立即修复选择，原生任务最迟在下一轮定时协调（10 秒）同步；保存设置会立即协调。服务器在列表读取之后才删除的竞态由下一轮重新获取列表修复。
+
 ## 名称与存储兼容
 
 界面名称为“被墙检测”，功能入口为“被墙检测总览”；方向以大陆出发为正向、回大陆为反向。为兼容已有安装，技术标识 `komari-gfw`、请求头和任务所有权前缀 `[Komari GFW:` 不随显示名称修改。
@@ -138,6 +144,7 @@ HTTP 响应 hook 中 `req.body` 恒为空，不能据响应形状猜 RPC 方法�
 
 - [插件指南](https://komari-monitor.github.io/komari-document/dev/plugin/index)
 - [Ping RPC](https://github.com/komari-monitor/komari/blob/1.6.1/web/rpc/jsonrpc/admin.ping.go)
+- [完整服务器列表与删除 RPC](https://github.com/komari-monitor/komari/blob/1.6.1/web/rpc/jsonrpc/admin.client.go)
 - [指标查询](https://github.com/komari-monitor/komari/blob/1.6.1/web/rpc/jsonrpc/public.metric.go)
 - [旧查询的 rollup 路径](https://github.com/komari-monitor/komari/blob/1.6.1/internal/metricstore/ping_records.go)
 - [通知 RPC](https://github.com/komari-monitor/komari/blob/1.6.1/web/rpc/jsonrpc/admin.notification.go)

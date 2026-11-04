@@ -47,6 +47,7 @@ export interface State {
   tasks: Record<string, number>; sources: Record<string, string>; monitors: Record<string, Monitor>;
   events: Notice[];
   hiddenTaskIds?: number[];
+  selectionNotice?: string;
 }
 export interface MetricSeries {
   metric_key: string; entity_id: string; tags?: Record<string, string>;

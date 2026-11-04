@@ -136,7 +136,7 @@ try {
   assert.equal(reverseTask.clients.length, 2);
   async function cycle() {
     const started = Date.now();
-    for (const task of tasks) {
+    for (const task of (await rpc("admin:getAllPingTasks")).filter(t => t.name.startsWith("[Komari GFW:"))) {
       const targetPort = Number(task.target.split(":").at(-1));
       for (const uuid of task.clients) {
         const agent = agents.find(a => a.uuid === uuid);
@@ -180,15 +180,25 @@ try {
   await cycle();
   console.log("PASS: unload pause, reload persistence and notification deduplication");
   if (process.env.KOMARI_TEST_UPGRADE_FROM) {
-    const before = await plugin("settings");
+    const removed = await rpc("admin:addClient", { name: "Deleted before upgrade" });
+    let before = await plugin("settings");
+    before = await plugin("settings", { config: { ...before.config, clients: [...before.config.clients, removed.uuid], reverse: { ...before.config.reverse, [removed.uuid]: { host: "127.0.0.1", port: ports[5].port } } }, revision: before.revision });
     const beforeTasks = await rpc("admin:getAllPingTasks");
+    await rpc("admin:removeClient", { uuid: removed.uuid });
     await install(zip);
-    assert.deepEqual((await plugin("settings")).config, before.config);
+    const expected = structuredClone(before.config);
+    expected.clients = expected.clients.filter(id => id !== removed.uuid);
+    delete expected.reverse[removed.uuid];
+    const repaired = await plugin("settings");
+    assert.deepEqual(repaired.config, expected);
+    assert.equal(repaired.lastError, "");
+    assert.match(repaired.selectionNotice, /已删除的受检服务器/);
     assert.equal((await plugin("overview")).events.length, 2);
     assert.equal(pluginMessages().length, 3);
-    assert.deepEqual((await rpc("admin:getAllPingTasks")).map(t => t.id).sort(), beforeTasks.map(t => t.id).sort());
+    assert.deepEqual((await rpc("admin:getAllPingTasks")).map(t => t.id).sort(), beforeTasks.filter(t => !t.name.endsWith(`:reverse:${removed.uuid}]`)).map(t => t.id).sort());
     await cycle();
-    console.log("PASS: upgrade retains configuration, notification history and task identities");
+    console.log("PASS: upgrade repairs deleted selection while retaining surviving configuration, notification history and task identities");
+    await plugin("settings", { config: repaired.config, revision: repaired.revision });
     for (const i of [0, 1, 2, 5]) await new Promise(r => ports[i].listener.close(r));
     overview = await cycle(); assert.equal(overview.rows[0].alarm, true);
     for (const i of [0, 1, 2, 5]) ports[i].listener = await tcpServer(ports[i].port);
@@ -445,10 +455,51 @@ try {
   await configPage.screenshot({ path: join(root, "overview-mobile.png"), fullPage: true });
   assert.deepEqual(errors, []);
   console.log("PASS: native admin navigation, display names, no duplicate header links, config save/reload and desktop/mobile UI");
+  settings = await plugin("settings");
+  await plugin("settings", { config: { ...settings.config, enabled: true }, revision: settings.revision });
+  await cycle();
+  const existingUserTask = (await rpc("admin:getAllPingTasks")).find(t => t.id === userTask.task_id);
+  const messageCount = pluginMessages().length;
+  await rpc("admin:removeClient", { uuid: agents[1].uuid });
+  overview = await plugin("refresh", {});
+  assert.equal(overview.lastError, "");
+  assert.equal(overview.enabled, true);
+  assert.equal(overview.strict, false);
+  assert.match(overview.selectionNotice, /严格模式已自动关闭，继续普通模式监测/);
+  assert.ok(!(await rpc("admin:getAllPingTasks")).some(t => t.name.includes(":reverse:")));
+  assert.deepEqual((await rpc("admin:getAllPingTasks")).find(t => t.id === userTask.task_id), existingUserTask);
+  overview = await cycle();
+  assert.equal(overview.rows[0].health, "healthy");
+  assert.equal(pluginMessages().length, messageCount);
+  await configPage.setViewportSize({ width: 1400, height: 1000 });
+  await configPage.goto(base + "/admin/plugins/config?short=komari-gfw");
+  await waitFor(async () => !(await configFrame.locator("#settings-fields").isDisabled()), "Repaired settings enabled");
+  assert.equal(await configFrame.locator("#enabled").isChecked(), true);
+  assert.equal(await configFrame.locator("#strict").isChecked(), false);
+  assert.match(await configFrame.locator("#message").innerText(), /严格模式已自动关闭/);
+  await configPage.screenshot({ path: join(root, "deleted-observer-settings.png"), fullPage: true });
+  await configFrame.getByRole("button", { name: "保存配置", exact: true }).click();
+  await configFrame.getByText("配置已保存，探测任务已同步。", { exact: true }).waitFor();
+  await rpc("admin:setPluginEnabled", { short: "komari-gfw", enabled: false });
+  await rpc("admin:setPluginEnabled", { short: "komari-gfw", enabled: true, approved: true });
+  settings = await plugin("settings");
+  assert.equal(settings.config.strict, false);
+  assert.equal(settings.config.enabled, true);
+  await cycle();
+  await rpc("admin:removeClient", { uuid: monitored.uuid });
+  overview = await plugin("refresh", {});
+  assert.equal(overview.lastError, "");
+  assert.equal(overview.enabled, false);
+  assert.deepEqual(overview.rows, []);
+  assert.equal(pluginMessages().length, messageCount);
+  settings = await plugin("settings");
+  await plugin("settings", { config: settings.config, revision: settings.revision });
+  assert.deepEqual(errors, []);
+  console.log("PASS: deleted observer disables strict mode only; basic probes, settings save and reload continue; deleting last target stops monitoring without false recovery");
   await plugin("cleanup", { confirm: "DELETE_PLUGIN_TASKS" });
   assert.deepEqual((await rpc("admin:getAllPingTasks") ?? []).map(t => t.id), [userTask.task_id]);
   console.log("PASS: owned-task cleanup");
-  await writeFile(join(root, "host-test-result.json"), JSON.stringify({ komari: hostVersion, plugin: manifest.version, upgradeFrom: Boolean(process.env.KOMARI_TEST_UPGRADE_FROM), passed: true, checkedAt: new Date().toISOString(), checks: ["ZIP lifecycle", "ACL/CSRF", "raw metrics", "strict 2-observer block/recovery", "Webhook title/direction/redaction", "persistence", "owned rollup retention", "public HTTP/WS filtering", "user history/statistics", "paused filtering", "observer search", "desktop/mobile UI", "cleanup"], limitation: "Synthetic v2 Agents with real loopback TCP, not production geographically distributed Agents; real retention test uses SQLite. Hook limits are not an authorization boundary." }, null, 2));
+  await writeFile(join(root, "host-test-result.json"), JSON.stringify({ komari: hostVersion, plugin: manifest.version, upgradeFrom: Boolean(process.env.KOMARI_TEST_UPGRADE_FROM), passed: true, checkedAt: new Date().toISOString(), checks: ["ZIP lifecycle", "ACL/CSRF", "raw metrics", "strict 2-observer block/recovery", "Webhook title/direction/redaction", "persistence", "owned rollup retention", "public HTTP/WS filtering", "user history/statistics", "paused filtering", "observer search", "desktop/mobile UI", "deleted observer switches to basic monitoring", "deleted selection save/reload", "deleted last target stops without false recovery", "cleanup"], limitation: "Synthetic v2 Agents with real loopback TCP, not production geographically distributed Agents; real retention test uses SQLite. Hook limits are not an authorization boundary." }, null, 2));
 } catch (error) {
   await writeFile(join(root, "host-test-error.log"), log);
   console.error(error?.stack ?? String(error)); process.exitCode = 1;

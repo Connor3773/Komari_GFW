@@ -23,6 +23,16 @@ export function notificationReadiness(settings: Record<string, unknown>): Notifi
   return { ready: true, reason: "系统通知配置已就绪，实际投递请用测试通知验证", channel };
 }
 
+function selectionNotice(previous: Config, current: Config): string {
+  const clients = new Set(previous.clients.filter(id => !current.clients.includes(id))).size;
+  const observers = new Set(previous.observers.filter(id => !current.observers.includes(id))).size;
+  if (!clients && !observers) return "";
+  const removed = [clients ? `${clients} 台已删除的受检服务器` : "", observers ? `${observers} 台已删除的境内探针` : ""].filter(Boolean).join("和");
+  const mode = previous.strict && !current.strict ? `严格模式已自动关闭，${current.enabled ? "继续普通模式监测" : "监测保持关闭"}。` : "";
+  const paused = previous.enabled && !current.enabled ? "受检服务器已全部删除，监测已自动关闭。" : "";
+  return `已移除 ${removed}及其配置。${mode}${paused}`;
+}
+
 export class Service {
   state: State;
   clients: Client[] = [];
@@ -48,12 +58,24 @@ export class Service {
   persist() { this.trimHistory(); this.store.save(this.state); }
 
   async refreshClients(): Promise<void> {
-    const result = await this.rpc.call<Record<string, unknown>[] | null>("admin:listClients");
+    const result = await this.rpc.call<unknown>("admin:listClients");
     if (result !== null && !Array.isArray(result)) throw new Error("服务器列表响应格式不兼容");
-    this.clients = (result ?? []).map(c => ({
-      uuid: String(c.uuid ?? ""), name: cleanText(c.name) || "未命名服务器",
-      ipv4: cleanText(c.ipv4, 100), ipv6: cleanText(c.ipv6, 100), group: cleanText(c.group),
-    })).filter(c => /^[a-zA-Z0-9_-]{1,80}$/.test(c.uuid));
+    const available = new Set<string>();
+    const clients = (result ?? []).map(c => {
+      if (!c || typeof c !== "object" || typeof c.uuid !== "string" || !/^[a-zA-Z0-9_-]{1,80}$/.test(c.uuid) || available.has(c.uuid)) {
+        throw new Error("服务器列表响应格式不兼容");
+      }
+      available.add(c.uuid);
+      return { uuid: c.uuid, name: cleanText(c.name) || "未命名服务器", ipv4: cleanText(c.ipv4, 100), ipv6: cleanText(c.ipv6, 100), group: cleanText(c.group) };
+    });
+    // Validate the complete list before changing persisted selection; never prune on RPC failure.
+    const cfg = validateConfig(this.state.config, available);
+    this.clients = clients;
+    const notice = selectionNotice(this.state.config, cfg);
+    if (notice) {
+      this.state.selectionNotice = notice;
+      this.applyConfig(cfg, "服务器选择变化，旧通知已取消");
+    }
   }
 
   async refreshNotification(): Promise<void> {
@@ -115,11 +137,10 @@ export class Service {
     }
     const pause = owned.filter(t => !used.has(t.id) && ((t.clients ?? []).length || t.default_on));
     if (pause.length) await this.rpc.call("admin:editPingTask", { tasks: pause.map(t => ({ ...t, clients: [], default_on: false })) });
-    if (active) {
-      const obsolete = owned.filter(t => !used.has(t.id));
-      if (obsolete.length) await this.rpc.call("admin:deletePingTask", { id: obsolete.map(t => t.id) });
-      this.state.tasks = Object.fromEntries(Object.entries(this.state.tasks).filter(([key]) => desired.has(key)));
-    }
+    const retiredReverse = (key: string) => key.startsWith("reverse:") && (!cfg.strict || !cfg.clients.includes(key.slice(8)));
+    const obsolete = owned.filter(t => !used.has(t.id) && (active || retiredReverse(t.name.slice(`${PREFIX}${this.state.instance}:`.length, -1))));
+    if (obsolete.length) await this.rpc.call("admin:deletePingTask", { id: obsolete.map(t => t.id) });
+    this.state.tasks = Object.fromEntries(Object.entries(this.state.tasks).filter(([key]) => active ? desired.has(key) : !retiredReverse(key)));
     if (sourcesChanged) {
       this.resetMonitors();
       for (const event of this.state.events) if (event.delivery === "pending") {
@@ -138,21 +159,25 @@ export class Service {
   }
 
   async saveConfig(raw: unknown, revision: unknown): Promise<void> {
-    if (revision !== this.state.revision) throw new UserError("配置已在其它页面修改，请刷新后重试");
-    const cfg = validateConfig(raw);
+    if (revision !== this.state.revision) throw new UserError("配置或服务器列表已变化，请刷新后重试");
     await this.refreshClients();
-    for (const uuid of [...cfg.clients, ...cfg.observers]) if (!this.clients.some(c => c.uuid === uuid)) throw new UserError("服务器选择包含不存在的项目");
+    const cfg = validateConfig(raw, new Set(this.clients.map(c => c.uuid)));
     if (cfg.strict) for (const uuid of cfg.clients) reverseAddress(cfg, this.clients.find(c => c.uuid === uuid)!);
+    this.state.selectionNotice = selectionNotice(raw as Config, cfg);
+    this.applyConfig(cfg, "检测配置变更，旧通知已取消");
+    try { await this.reconcile(); this.lastError = ""; }
+    catch { this.lastError = "配置已保存，但探测任务同步失败；会自动重试，请检查宿主日志与插件权限"; }
+  }
+
+  private applyConfig(cfg: Config, reason: string): void {
     const changed = detectionSignature(cfg) !== detectionSignature(this.state.config);
     this.state.config = cfg;
     this.state.revision++;
     if (changed) {
       this.resetMonitors();
-      for (const event of this.state.events) if (event.delivery === "pending") { event.delivery = "superseded"; event.lastError = "检测配置变更，旧通知已取消"; }
+      for (const event of this.state.events) if (event.delivery === "pending") { event.delivery = "superseded"; event.lastError = reason; }
     }
     this.persist();
-    try { await this.reconcile(); this.lastError = ""; }
-    catch { this.lastError = "配置已保存，但探测任务同步失败；会自动重试，请检查宿主日志与插件权限"; }
   }
 
   private async samples(now: number): Promise<Record<string, Record<string, Sample[]>>> {
@@ -292,7 +317,7 @@ export class Service {
   }
 
   settings() {
-    return { config: this.state.config, revision: this.state.revision, clients: this.clients.map(c => safeClient(c, this.state.config.maskIp)), notification: this.notification, lastError: this.lastError, retentionError: this.retentionError, visibilityError: this.visibility.lastError };
+    return { config: this.state.config, revision: this.state.revision, clients: this.clients.map(c => safeClient(c, this.state.config.maskIp)), notification: this.notification, lastError: this.lastError, retentionError: this.retentionError, visibilityError: this.visibility.lastError, selectionNotice: this.state.selectionNotice ?? "" };
   }
 
   snapshot() {
@@ -316,7 +341,7 @@ export class Service {
     return {
       now, enabled: cfg.enabled, strict: cfg.strict, intervalSeconds: cfg.intervalSeconds,
       failureThreshold: cfg.failureThreshold, recoveryThreshold: cfg.recoveryThreshold,
-      rows, targets: cfg.targets, lastPoll: this.lastPoll, lastError: this.lastError, retentionError: this.retentionError, visibilityError: this.visibility.lastError, notification: this.notification,
+      rows, targets: cfg.targets, lastPoll: this.lastPoll, lastError: this.lastError, retentionError: this.retentionError, visibilityError: this.visibility.lastError, selectionNotice: this.state.selectionNotice ?? "", notification: this.notification,
       events: this.state.events.slice(-100).reverse().map(e => ({ ...e, name: safeClient(this.clients.find(c => c.uuid === e.client) ?? { uuid: e.client, name: "已删除服务器", ipv4: "", ipv6: "", group: "" }, cfg.maskIp).name })),
     };
   }

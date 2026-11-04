@@ -72,7 +72,7 @@ export function normalizeAddress(raw: unknown): string {
   return `${normalizeHost(match[1])}:${port}`;
 }
 
-export function validateConfig(raw: unknown): Config {
+export function validateConfig(raw: unknown, available?: ReadonlySet<string>): Config {
   const v = object(raw);
   if (!Array.isArray(v.targets) || v.targets.length !== 5) throw new Error("必须配置 3 个大陆和 2 个非大陆目标");
   const targets: Target[] = SLOTS.map(id => {
@@ -82,10 +82,19 @@ export function validateConfig(raw: unknown): Config {
     return { id, name, address: normalizeAddress(item.address) };
   });
   if (new Set(targets.map(t => t.address)).size !== 5) throw new Error("5 个探测目标不能重复");
-  const clients = ids(v.clients, 200);
-  const observers = ids(v.observers, 20);
-  const strict = bool(v.strict, "严格模式");
-  const enabled = bool(v.enabled, "监测总开关");
+  let clients = ids(v.clients, 200);
+  let observers = ids(v.observers, 20);
+  let strict = bool(v.strict, "严格模式");
+  let enabled = bool(v.enabled, "监测总开关");
+  if (available) {
+    const remaining = clients.filter(id => available.has(id));
+    const probes = observers.filter(id => available.has(id));
+    // A confirmed deletion changes the selected topology, not the Ping results.
+    if (probes.length !== observers.length) strict = false;
+    if (clients.length && !remaining.length) enabled = false;
+    clients = remaining;
+    observers = probes;
+  }
   const reverse: Record<string, ReverseTarget> = {};
   const inputs = object(v.reverse);
   for (const uuid of clients) {
