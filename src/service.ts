@@ -316,8 +316,14 @@ export class Service {
     this.persist();
   }
 
+  acknowledgeSelection(revision: unknown, notice: unknown): void {
+    if (revision !== this.state.revision || !notice || notice !== this.state.selectionNotice) return;
+    this.state.selectionNotice = "";
+    this.persist();
+  }
+
   settings() {
-    return { config: this.state.config, revision: this.state.revision, clients: this.clients.map(c => safeClient(c, this.state.config.maskIp)), notification: this.notification, lastError: this.lastError, retentionError: this.retentionError, visibilityError: this.visibility.lastError, selectionNotice: this.state.selectionNotice ?? "" };
+    return { config: this.state.config, revision: this.state.revision, clients: this.clients.map(c => safeClient(c, this.state.config.maskIp)), notification: this.notification, lastError: this.lastError, retentionError: this.retentionError, visibilityError: this.visibility.lastError, selectionNotice: this.state.selectionNotice ?? "", selectionNoticeRevision: this.state.revision };
   }
 
   snapshot() {
@@ -341,7 +347,7 @@ export class Service {
     return {
       now, enabled: cfg.enabled, strict: cfg.strict, intervalSeconds: cfg.intervalSeconds,
       failureThreshold: cfg.failureThreshold, recoveryThreshold: cfg.recoveryThreshold,
-      rows, targets: cfg.targets, lastPoll: this.lastPoll, lastError: this.lastError, retentionError: this.retentionError, visibilityError: this.visibility.lastError, selectionNotice: this.state.selectionNotice ?? "", notification: this.notification,
+      rows, targets: cfg.targets, lastPoll: this.lastPoll, lastError: this.lastError, retentionError: this.retentionError, visibilityError: this.visibility.lastError, selectionNotice: this.state.selectionNotice ?? "", selectionNoticeRevision: this.state.revision, notification: this.notification,
       events: this.state.events.slice(-100).reverse().map(e => ({ ...e, name: safeClient(this.clients.find(c => c.uuid === e.client) ?? { uuid: e.client, name: "已删除服务器", ipv4: "", ipv6: "", group: "" }, cfg.maskIp).name })),
     };
   }

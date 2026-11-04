@@ -313,6 +313,41 @@ test("automatic pruning invalidates old forms without losing concurrent user con
   assert.deepEqual(f.service.state.config.clients, ["a"]);
 });
 
+test("acknowledging a displayed selection notice persists without invalidating a settings form", async () => {
+  const f = fixture();
+  await f.service.saveConfig({ ...f.service.state.config, clients: ["a", "b"], enabled: true }, 0);
+  f.removeClient("b"); await f.service.tick();
+  const form = structuredClone(f.service.settings());
+  assert.ok(form.selectionNotice);
+  assert.equal(f.service.snapshot().selectionNotice, form.selectionNotice);
+  f.service.acknowledgeSelection(form.selectionNoticeRevision, form.selectionNotice);
+  assert.equal(f.service.settings().selectionNotice, "");
+  assert.equal(f.service.state.revision, form.revision);
+  assert.equal(f.saved().selectionNotice, "");
+  const restored = new Service(structuredClone(f.saved()), f.rpc, { save() {} }, f.now);
+  await restored.tick();
+  assert.equal(restored.snapshot().selectionNotice, "");
+  await f.service.saveConfig(form.config, form.revision);
+  assert.equal(f.service.lastError, "");
+});
+
+test("stale or mismatched acknowledgements cannot erase a newer identical notice", async () => {
+  const f = fixture();
+  await f.service.saveConfig({ ...f.service.state.config, clients: ["a", "b", "observer"], enabled: true }, 0);
+  f.removeClient("b"); await f.service.tick();
+  const old = f.service.snapshot();
+  f.removeClient("observer"); await f.service.tick();
+  const current = f.service.snapshot();
+  assert.equal(current.selectionNotice, old.selectionNotice);
+  assert.notEqual(current.selectionNoticeRevision, old.selectionNoticeRevision);
+  f.service.acknowledgeSelection(old.selectionNoticeRevision, old.selectionNotice);
+  f.service.acknowledgeSelection(current.selectionNoticeRevision, "wrong notice");
+  f.service.acknowledgeSelection(String(current.selectionNoticeRevision), current.selectionNotice);
+  assert.equal(f.service.snapshot().selectionNotice, current.selectionNotice);
+  f.service.acknowledgeSelection(current.selectionNoticeRevision, current.selectionNotice);
+  assert.equal(f.service.snapshot().selectionNotice, "");
+});
+
 for (const response of [undefined, {}, { data: [] }, [null], [{}], [{ uuid: "a" }, { uuid: 1 }], [{ uuid: "a" }, { uuid: "a" }], [{ uuid: "invalid/uuid" }]]) test(`invalid client list cannot prune selections (${JSON.stringify(response)})`, async () => {
   const f = fixture();
   await f.service.saveConfig({ ...f.service.state.config, clients: ["a"], enabled: true }, 0);

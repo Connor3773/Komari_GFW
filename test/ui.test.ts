@@ -1,0 +1,81 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { createContext, runInContext } from "node:vm";
+
+const source = readFileSync(new URL("../pages/app.js", import.meta.url), "utf8");
+assert.match(source, /\nstart\(\);\s*$/);
+const flush = () => new Promise<void>(resolve => setImmediate(resolve));
+const data = (revision = 1) => ({ selectionNotice: "Selection adjusted", selectionNoticeRevision: revision });
+
+function fixture() {
+  const banner = { hidden: true, textContent: "" };
+  const error = { hidden: false, textContent: "Real synchronization error" };
+  const calls: { path: string; body: unknown }[] = [];
+  const timers = new Map<number, { fn: () => void; delay: number }>();
+  let timerId = 0, fail = false;
+  const document = { hidden: false, getElementById: (id: string) => id === "selection-notice" ? banner : error };
+  const context = createContext({ document,
+    setTimeout(fn: () => void, delay: number) { const id = ++timerId; timers.set(id, { fn, delay }); return id; },
+    clearTimeout(id: number) { timers.delete(id); },
+  });
+  // Execute the shipped UI functions, but leave startup/network/DOM rendering to the host test.
+  runInContext(source.replace(/\nstart\(\);\s*$/, "\n"), context);
+  context.api = async (path: string, body: unknown) => {
+    calls.push({ path, body: JSON.parse(JSON.stringify(body)) });
+    if (fail) throw new Error("Network unavailable");
+    return { ok: true };
+  };
+  return { banner, error, calls, timers, document, render: (value: unknown) => context.renderSelectionNotice(value),
+    fail: (value: boolean) => { fail = value; },
+    expire: () => { const jobs = [...timers.values()]; timers.clear(); for (const timer of jobs) timer.fn(); },
+  };
+}
+
+test("selection notice is shown once, acknowledged, expires in 8 seconds and does not hide real errors", async () => {
+  const f = fixture();
+  f.render(data()); await flush();
+  assert.equal(f.banner.hidden, false);
+  assert.equal(f.banner.textContent, data().selectionNotice);
+  assert.equal([...f.timers.values()][0].delay, 8000);
+  assert.deepEqual(f.calls, [{ path: "ack-selection", body: { revision: 1, notice: data().selectionNotice } }]);
+  f.expire();
+  f.render(data()); await flush();
+  assert.equal(f.banner.hidden, true);
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.error.hidden, false);
+  assert.equal(f.error.textContent, "Real synchronization error");
+});
+
+test("hidden pages do not consume a notice before it can be displayed", async () => {
+  const f = fixture(); f.document.hidden = true;
+  f.render(data()); await flush();
+  assert.equal(f.banner.hidden, true);
+  assert.equal(f.calls.length, 0);
+  f.document.hidden = false;
+  f.render(data()); await flush();
+  assert.equal(f.banner.hidden, false);
+  assert.equal(f.calls.length, 1);
+});
+
+test("failed acknowledgements retry without repeatedly displaying the same message", async () => {
+  const f = fixture(); f.fail(true);
+  f.render(data()); await flush();
+  f.expire(); f.fail(false);
+  f.render(data()); await flush();
+  assert.equal(f.banner.hidden, true);
+  assert.equal(f.calls.length, 2);
+  f.render(data()); await flush();
+  assert.equal(f.calls.length, 2);
+});
+
+test("a newer deletion with the same wording receives its own one-time notice", async () => {
+  const f = fixture();
+  f.render(data()); await flush();
+  f.render(data(2)); await flush();
+  assert.equal(f.banner.hidden, false);
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.timers.size, 1);
+  f.expire(); f.render(data(2)); await flush();
+  assert.equal(f.banner.hidden, true);
+});

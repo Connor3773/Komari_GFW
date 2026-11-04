@@ -455,6 +455,7 @@ try {
   await configPage.screenshot({ path: join(root, "overview-mobile.png"), fullPage: true });
   assert.deepEqual(errors, []);
   console.log("PASS: native admin navigation, display names, no duplicate header links, config save/reload and desktop/mobile UI");
+  await configPage.goto(base + "/api/version");
   settings = await plugin("settings");
   await plugin("settings", { config: { ...settings.config, enabled: true }, revision: settings.revision });
   await cycle();
@@ -476,8 +477,15 @@ try {
   await waitFor(async () => !(await configFrame.locator("#settings-fields").isDisabled()), "Repaired settings enabled");
   assert.equal(await configFrame.locator("#enabled").isChecked(), true);
   assert.equal(await configFrame.locator("#strict").isChecked(), false);
-  assert.match(await configFrame.locator("#message").innerText(), /严格模式已自动关闭/);
+  assert.match(await configFrame.locator("#selection-notice").innerText(), /严格模式已自动关闭/);
   await configPage.screenshot({ path: join(root, "deleted-observer-settings.png"), fullPage: true });
+  const repairedRevision = (await plugin("settings")).revision;
+  await waitFor(async () => !(await plugin("settings")).selectionNotice, "Selection notice acknowledged without saving");
+  await waitFor(() => configFrame.locator("#selection-notice").isHidden(), "One-time notice auto-dismissed", 12000);
+  assert.equal((await plugin("settings")).revision, repairedRevision);
+  await configPage.reload();
+  await waitFor(async () => !(await configFrame.locator("#settings-fields").isDisabled()), "Acknowledged settings reloaded");
+  assert.equal(await configFrame.locator("#selection-notice").isHidden(), true);
   await configFrame.getByRole("button", { name: "保存配置", exact: true }).click();
   await configFrame.getByText("配置已保存，探测任务已同步。", { exact: true }).waitFor();
   await rpc("admin:setPluginEnabled", { short: "komari-gfw", enabled: false });
@@ -495,7 +503,7 @@ try {
   settings = await plugin("settings");
   await plugin("settings", { config: settings.config, revision: settings.revision });
   assert.deepEqual(errors, []);
-  console.log("PASS: deleted observer disables strict mode only; basic probes, settings save and reload continue; deleting last target stops monitoring without false recovery");
+  console.log("PASS: deleted observer disables strict mode only; notice acknowledges and expires without saving, reload does not repeat it; basic probes continue; last target deletion stops without false recovery");
   await plugin("cleanup", { confirm: "DELETE_PLUGIN_TASKS" });
   assert.deepEqual((await rpc("admin:getAllPingTasks") ?? []).map(t => t.id), [userTask.task_id]);
   console.log("PASS: owned-task cleanup");

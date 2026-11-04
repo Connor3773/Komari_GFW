@@ -65,6 +65,7 @@ async function load() {
   route("GET", "overview", async () => service.snapshot());
   route("GET", "settings", async () => { await service.refreshClients(); await service.refreshNotification(); return service.settings(); });
   route("POST", "settings", async body => { await service.saveConfig(body.config, body.revision); return service.settings(); });
+  route("POST", "ack-selection", async body => { service.acknowledgeSelection(body.revision, body.notice); return { ok: true }; });
   route("POST", "test-notification", async () => { await service.testNotification(); return { ok: true }; });
   route("POST", "cleanup", async body => { if (body.confirm !== "DELETE_PLUGIN_TASKS") throw new UserError("请确认删除插件任务和探测历史"); await service.cleanup(); return { ok: true }; });
   route("POST", "refresh", async () => { await service.tick(); return service.snapshot(); });
