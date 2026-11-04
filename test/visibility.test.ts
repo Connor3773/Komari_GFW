@@ -37,10 +37,10 @@ function fixture() {
   return { state, visibility, hooks, run, prepare, finish, rpc, advance() { now += 121000; } };
 }
 
-test("hooks are limited to the three public paths, never Agent/admin routes or a wildcard", () => {
+test("hooks are limited to Ping reads and RPC transports, never Agent or admin writes", () => {
   const f = fixture();
-  assert.equal(f.hooks.size, 8);
-  for (const key of f.hooks.keys()) assert.match(key, /(?:GET \/api\/(?:task|records)\/ping|POST \/api\/rpc2|ws(?:Message|Send|Close) \/api\/rpc2)$/);
+  assert.equal(f.hooks.size, 9);
+  for (const key of f.hooks.keys()) assert.match(key, /(?:GET \/api\/(?:task|records)\/ping|response GET \/api\/admin\/ping\/\*|POST \/api\/rpc2|ws(?:Message|Send|Close) \/api\/rpc2)$/);
 });
 
 test("ownership needs exact instance marker; prefix lookalikes and foreign instances remain", () => {
@@ -69,6 +69,59 @@ test("REST removes internal tasks for anonymous and logged-in visitors without c
   f.run("response", "GET /api/task/ping", {}, res);
   assert.deepEqual(JSON.parse(res.body), { status: "success", message: "", data: [user] });
   assert.equal((res.headers as any)["cache-control"], "no-store");
+});
+
+test("admin REST list with slash and query hides current and legacy owned tasks, preserving user fields", () => {
+  const f = fixture();
+  const legacy = { id: 17, name: `${PREFIX}${instance}:reverse:old-server]`, clients: ["a"], target: "example.com:80" };
+  const ordinary = { ...user, clients: ["a"], default_on: true, target: "example.org:443", type: "tcp", interval: 60, weight: 2 };
+  for (const url of ["/api/admin/ping", "/api/admin/ping/", "/api/admin/ping?x=1", "/api/admin/ping/?x=1"]) {
+    const data = { status: "success", message: "", data: [own, legacy, ordinary] };
+    const res = { statusCode: 200, headers: { etag: "old" }, body: JSON.stringify(data) };
+    f.run("response", "GET /api/admin/ping/*", { url }, res);
+    assert.deepEqual(JSON.parse(res.body), { ...data, data: [ordinary] });
+    assert.equal((res.headers as any)["cache-control"], "no-store");
+    assert.equal((res.headers as any).etag, undefined);
+  }
+  assert.ok(f.visibility.has(17));
+});
+
+test("admin subtree hook ignores other paths without parsing their response", () => {
+  const f = fixture();
+  for (const url of ["/api/admin/ping/add", "/api/admin/ping/delete", "/api/admin/ping/edit", "/api/admin/ping/order", "/api/admin/ping/future", "/api/admin/ping-extra"]) {
+    const res = { statusCode: 200, headers: { etag: "unchanged" }, body: "not-json" };
+    const before = structuredClone(res);
+    f.run("response", "GET /api/admin/ping/*", { url }, res);
+    assert.deepEqual(res, before);
+  }
+  assert.equal(f.visibility.lastError, "");
+});
+
+test("admin REST keeps errors and native empty responses, rejects unknown list wrappers", () => {
+  const f = fixture();
+  for (const body of [{ status: "success", data: [] }, { status: "success", data: null }, { status: "success" }, { status: "error", message: "denied" }]) {
+    const res = { statusCode: 200, headers: {}, body: JSON.stringify(body) };
+    f.run("response", "GET /api/admin/ping/*", { url: "/api/admin/ping/" }, res);
+    assert.deepEqual(JSON.parse(res.body), body);
+  }
+  const denied = { statusCode: 403, headers: {}, body: '{"status":"error","message":"denied"}' };
+  f.run("response", "GET /api/admin/ping/*", { url: "/api/admin/ping/" }, denied);
+  assert.equal(denied.statusCode, 403);
+  assert.equal(denied.body, '{"status":"error","message":"denied"}');
+  const paged = { statusCode: 200, headers: {}, body: JSON.stringify({ status: "success", data: { tasks: [own, user], total: 2 } }) };
+  f.run("response", "GET /api/admin/ping/*", { url: "/api/admin/ping/" }, paged);
+  assert.equal(paged.statusCode, 502);
+  assert.ok(!paged.body.includes(own.name));
+});
+
+test("admin task RPC hides owned tasks without changing its original input or user fields", () => {
+  const f = fixture();
+  const source = [own, { ...user, clients: ["a"], target: "example.org:443", default_on: false, weight: 0 }];
+  assert.deepEqual(f.rpc("admin:getAllPingTasks", source).result, source.slice(1));
+  assert.deepEqual(source[0], own);
+  assert.equal(source.length, 2);
+  assert.deepEqual(f.rpc("admin:getAllPingTasks", [own]).result, []);
+  assert.equal(f.rpc("admin:getAllPingTasks", null).result, null);
 });
 
 test("REST records remove internal data and recompute count and unsampled client summary", () => {
@@ -132,21 +185,23 @@ test("latest-status single and map responses strip only internal ping keys", () 
 
 test("mixed batches, reordered responses and duplicate original IDs cannot misidentify methods", () => {
   const f = fixture();
-  const { req, data } = f.prepare([request("public:getPublicPingTasks", {}, "same"), request("admin:getAllPingTasks", {}, "same"), request("public:getPingRecords", { uuid: "a" }, null)]);
+  const { req, data } = f.prepare([request("public:getPublicPingTasks", {}, "same"), request("admin:getAllPingTasks", {}, "same"), request("public:getPingRecords", { uuid: "a" }, null), request("admin:listClients", {}, "same")]);
   const response = f.finish(req, [
     { jsonrpc: "2.0", id: data[2].id, result: result() },
     { jsonrpc: "2.0", id: data[1].id, result: [own, user] },
     { jsonrpc: "2.0", id: data[0].id, result: [own, user] },
+    { jsonrpc: "2.0", id: data[3].id, result: [own, user] },
   ]).data;
-  assert.deepEqual(response.map((r: any) => r.id), [null, "same", "same"]);
-  assert.deepEqual(response[1].result, [own, user]);
+  assert.deepEqual(response.map((r: any) => r.id), [null, "same", "same", "same"]);
+  assert.deepEqual(response[1].result, [user]);
   assert.deepEqual(response[2].result, [user]);
+  assert.deepEqual(response[3].result, [own, user]);
   assert.deepEqual(response[0].result.records, [row(9)]);
 });
 
 test("unrelated RPC and common load requests are byte-for-byte untouched", () => {
   const f = fixture();
-  for (const method of ["admin:getAllPingTasks", "admin:dbQuery", "public:getVersion", "public:queryMetricsExtra", "common:getRecords", "public:queryMetrics", "getRecords"]) {
+  for (const method of ["admin:getAllPingTasksExtra", "admin:addPingTask", "admin:editPingTask", "admin:deletePingTask", "admin:orderPingTask", "admin:dbQuery", "public:getVersion", "public:queryMetricsExtra", "common:getRecords", "public:queryMetrics", "getRecords"]) {
     const body = JSON.stringify(request(method, { type: "load" }));
     const { req } = f.prepare(JSON.parse(body));
     assert.equal(req.body, body);
@@ -260,7 +315,7 @@ test("malformed requests and oversized batches retain native errors or fail expl
 
 test("forged correlation headers are erased and pending requests are bounded and expire", () => {
   const f = fixture();
-  const req = { url: "/api/rpc2", method: "POST", body: JSON.stringify(request("admin:getAllPingTasks")), headers: { "x-komari-gfw-filter": "fake" } };
+  const req = { url: "/api/rpc2", method: "POST", body: JSON.stringify(request("admin:listClients")), headers: { "x-komari-gfw-filter": "fake" } };
   f.run("request", "POST /api/rpc2", req);
   assert.deepEqual(req.headers, {});
   const first = f.prepare(request("public:getPublicPingTasks"));
@@ -275,9 +330,9 @@ test("forged correlation headers are erased and pending requests are bounded and
 
 test("WebSocket text/binary requests are correlated, filtered, restored and cleaned up", () => {
   const f = fixture();
-  for (const binary of [false, true]) {
+  for (const method of ["public:getPublicPingTasks", "admin:getAllPingTasks"]) for (const binary of [false, true]) {
     const ctx = { connId: 5 };
-    const text = JSON.stringify(request("public:getPublicPingTasks", {}, "id"));
+    const text = JSON.stringify(request(method, {}, "id"));
     const incoming = f.run("wsMessage", "/api/rpc2", ctx, { data: binary ? Uint8Array.from(Buffer.from(text)).buffer : text });
     const wire = JSON.parse(incoming.data);
     const reply = JSON.stringify({ jsonrpc: "2.0", id: wire.id, result: [own, user] });

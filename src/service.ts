@@ -52,6 +52,11 @@ export class Service {
     this.rpc = rpc;
     this.store = store;
     this.clock = clock;
+    for (const [uuid, monitor] of Object.entries(state.monitors)) {
+      const lastAlarm = state.events.filter(event => event.client === uuid && event.type === "blocked").at(-1);
+      const legacyDirection = state.config.strict && (!lastAlarm || lastAlarm.reverseTotal > 0) ? "both" : "basic";
+      monitor.alarmDirection = monitor.alarm ? monitor.alarmDirection ?? legacyDirection : null;
+    }
     this.visibility = new TaskVisibility(state);
   }
 
@@ -155,7 +160,11 @@ export class Service {
 
   private resetMonitors(): void {
     const previous = this.state.monitors;
-    this.state.monitors = Object.fromEntries(this.state.config.clients.map(uuid => [uuid, newMonitor(this.clock(), previous[uuid])]));
+    this.state.monitors = Object.fromEntries(this.state.config.clients.map(uuid => {
+      const monitor = newMonitor(this.clock(), previous[uuid]);
+      if (monitor.alarm && !this.state.config.strict) monitor.alarmDirection = "basic";
+      return [uuid, monitor];
+    }));
   }
 
   async saveConfig(raw: unknown, revision: unknown): Promise<void> {
@@ -335,6 +344,8 @@ export class Service {
       const stale = keys.some(k => !m.latest[k] || now - m.latest[k].at > staleAfter(cfg));
       return {
         ...safeClient(client, cfg.maskIp), alarm: m.alarm, blockedSince: m.blockedSince,
+        alarmDirection: m.alarm ? (cfg.strict ? m.alarmDirection ?? "both" : "basic") : null,
+        candidateDirection: cfg.enabled && !stale && m.health === "suspect" ? m.candidateDirection ?? null : null,
         health: !cfg.enabled ? "paused" : stale && m.health !== "initializing" ? "unknown" : m.health,
         failureStreak: m.failureStreak, recoveryStreak: m.recoveryStreak, lastRoundAt: m.lastRoundAt,
         samples: keys.map(key => {

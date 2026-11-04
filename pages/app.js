@@ -2,6 +2,15 @@
 const $ = id => document.getElementById(id);
 const API = "/api/admin/plugins/komari-gfw/";
 const healthText = { initializing: "等待采样", healthy: "正常", suspect: "疑似被墙条件", degraded: "部分异常", outage: "全部失败", unknown: "数据不足", paused: "已暂停" };
+const blockText = direction => ({ basic: "疑似被墙", forward: "疑似正向墙", reverse: "疑似反向墙", both: "疑似双向墙" }[direction] || "疑似被墙");
+function eventText(event) {
+  if (event.type === "recovered") return "解除被墙状态";
+  const direction = event.direction || (event.reverseTotal ? "both" : "basic");
+  return event.previousDirection && event.previousDirection !== direction ? `方向变化：${blockText(event.previousDirection)} → ${blockText(direction)}` : blockText(direction);
+}
+function observationText(row) {
+  return row.health === "suspect" && row.candidateDirection ? `${blockText(row.candidateDirection)}条件` : healthText[row.health];
+}
 const deliveryText = { pending: "等待投递", sent: "已交给通知渠道", failed: "投递失败", superseded: "已取消旧通知" };
 let view;
 let model;
@@ -77,7 +86,7 @@ function renderOverview(data) {
   $("events").replaceChildren(...data.events.map(event => {
     const el = node("div", undefined, "event");
     const detail = node("div");
-    const title = node("strong", `${event.name} · ${event.type === "blocked" ? "疑似被墙" : "解除被墙状态"}`);
+    const title = node("strong", `${event.name} · ${eventText(event)}`);
     title.className = event.type === "blocked" ? "sample-bad" : "sample-ok";
     detail.append(title, node("p", `${deliveryText[event.delivery]}${event.attempts ? ` · 尝试 ${event.attempts} 次` : ""}${event.lastError ? " · " + event.lastError : ""}`));
     el.append(detail, node("time", time(event.at)));
@@ -107,9 +116,9 @@ function renderRows() {
     server.append(node("strong", row.name), node("small", row.ipv4 !== "未登记" ? row.ipv4 : row.ipv6 || "未登记", "mono"));
     if (row.group) server.append(node("small", row.group));
     const status = node("td");
-    status.append(node("span", row.alarm ? "被墙告警未解除" : healthText[row.health], "pill " + (row.alarm ? "bad" : row.health === "healthy" ? "good" : ["suspect", "outage", "degraded"].includes(row.health) ? "warn" : "")));
-    if (row.alarm) status.append(node("div", healthText[row.health], "small muted"));
-    if (row.health === "suspect" && !row.alarm) status.append(node("div", `确认 ${row.failureStreak}/${view.failureThreshold}`, "small muted"));
+    status.append(node("span", row.alarm ? blockText(row.alarmDirection) : observationText(row), "pill " + (row.alarm ? "bad" : row.health === "healthy" ? "good" : ["suspect", "outage", "degraded"].includes(row.health) ? "warn" : "")));
+    if (row.alarm) status.append(node("div", row.health === "suspect" && row.candidateDirection === row.alarmDirection ? "告警未解除" : `告警未解除 · ${observationText(row)}`, "small muted"));
+    if (row.health === "suspect" && (!row.alarm || row.candidateDirection !== row.alarmDirection)) status.append(node("div", `${row.alarm ? "方向变更" : "告警"}确认 ${row.failureStreak}/${view.failureThreshold}`, "small muted"));
     if (row.alarm && row.health === "healthy") status.append(node("div", `恢复确认 ${row.recoveryStreak}/${view.recoveryThreshold}`, "small muted"));
     tr.append(server, status);
     for (const target of view.targets) {

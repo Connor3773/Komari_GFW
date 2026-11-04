@@ -1,4 +1,8 @@
-import type { Client, Config, Notice } from "./types.ts";
+import type { BlockDirection, Client, Config, Notice } from "./types.ts";
+
+export function blockText(direction: BlockDirection): string {
+  return { basic: "疑似被墙", forward: "疑似正向墙", reverse: "疑似反向墙", both: "疑似双向墙" }[direction];
+}
 
 export function maskAddress(ip: string, enabled: boolean): string {
   if (!ip) return "未登记";
@@ -29,19 +33,22 @@ export function safeClient(client: Client, mask: boolean): Client {
 export function notificationEvent(event: Notice, client: Client, config: Config) {
   const safe = safeClient(client, config.maskIp);
   const blocked = event.type === "blocked";
+  const direction = event.direction ?? (event.reverseTotal ? "both" : "basic");
+  const changed = blocked && event.previousDirection && event.previousDirection !== direction;
   const lines = [
     `服务器：${safe.name}`,
     `IP：${client.ipv4 ? safe.ipv4 : safe.ipv6 || "未登记"}`,
-    `被墙状态：${blocked ? "疑似被墙" : "已解除"}`,
+    `被墙状态：${blocked ? blockText(direction) : "已解除"}`,
+    ...(changed ? [`状态变化：${blockText(event.previousDirection!)} → ${blockText(direction)}`] : []),
+    ...(!blocked && direction !== "basic" ? [`原被墙状态：${blockText(direction)}`] : []),
     `反向（受检服务器到大陆目标）：${event.mainland}/3 可达`,
     `非大陆对照（受检服务器到非大陆目标）：${event.overseas}/2 可达`,
     ...(event.reverseTotal ? [`正向（大陆探针到受检服务器）：${event.reverse}/${event.reverseTotal} 可达（严格模式）`] : []),
     ...(!blocked ? [`异常持续：${Math.max(0, Math.round((event.at - event.since) / 60000))} 分钟`] : []),
     `检测时间：${new Date(event.at).toISOString()}`,
-    "说明：TCP 连通性推断，不代表封锁原因已确证。",
   ];
   return {
-    event: blocked ? "服务器疑似被墙" : "服务器解除被墙状态",
+    event: changed ? "服务器被墙方向变化" : blocked ? "服务器疑似被墙" : "服务器解除被墙状态",
     clients: [], time: new Date(event.at).toISOString(), message: lines.join("\n"), emoji: "",
   };
 }

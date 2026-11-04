@@ -110,7 +110,7 @@ test("missing, future or badly aligned samples cannot form a round", () => {
   evaluate(s, {}, cfg, "server-a", epoch + 1000000);
   assert.equal(s.health, "unknown"); assert.equal(s.failureStreak, 0);
 });
-test("strict mode requires every mainland-to-server observer to fail and all to recover", () => {
+test("strict mixed observer results are inconclusive and recovery needs every observer", () => {
   const cfg = { ...config(), strict: true, observers: ["probe-a", "probe-b"], failureThreshold: 1, recoveryThreshold: 1 }, s = newMonitor(epoch);
   assert.equal(round(s, cfg, 1, [-1, -1, -1, 1, 1, -1, 10]).length, 0);
   assert.equal(round(s, cfg, 2, [-1, -1, -1, 1, 1, -1, -1])[0].type, "blocked");
@@ -142,7 +142,7 @@ for (const type of ["blocked", "recovered"] as const) test(`notification title a
   const event = { type, at: epoch, since: epoch, mainland: recovered ? 3 : 0, overseas: 2, reverse: recovered ? 2 : 0, reverseTotal: 2 } as Notice;
   const result = notificationEvent(event, { uuid: "server-a", name: "Test server", ipv4: "203.0.113.123", ipv6: "", group: "" }, config());
   assert.equal(result.event, recovered ? "服务器解除被墙状态" : "服务器疑似被墙");
-  assert.ok(result.message.includes(`被墙状态：${recovered ? "已解除" : "疑似被墙"}`));
+  assert.ok(result.message.includes(`被墙状态：${recovered ? "已解除" : "疑似双向墙"}`));
   assert.ok(result.message.includes(`反向（受检服务器到大陆目标）：${recovered ? 3 : 0}/3 可达`));
   assert.ok(result.message.includes("非大陆对照（受检服务器到非大陆目标）：2/2 可达"));
   assert.ok(result.message.includes(`正向（大陆探针到受检服务器）：${recovered ? 2 : 0}/2 可达（严格模式）`));
@@ -156,15 +156,103 @@ test("basic notifications do not claim mainland-to-server evidence", () => {
   assert.ok(result.message.includes("非大陆对照（受检服务器到非大陆目标）：1/2 可达"));
 });
 
-for (const strict of [false, true]) test(`exhaustive connectivity truth table (strict=${strict})`, () => {
-  const cfg = { ...config(), strict, observers: ["probe-a", "probe-b"], failureThreshold: 1, recoveryThreshold: 1 };
+for (const strict of [false, true]) for (const overseasRequired of [1, 2]) test(`exhaustive connectivity truth table (strict=${strict}, overseas=${overseasRequired})`, () => {
+  const cfg = { ...config(), strict, overseasRequired, observers: ["probe-a", "probe-b"], failureThreshold: 1, recoveryThreshold: 1 };
   const n = strict ? 7 : 5;
   for (let bits = 0; bits < 2 ** n; bits++) {
     const values = Array.from({ length: n }, (_, i) => bits & (1 << i) ? 1 : -1);
-    const blocked = values.slice(0, 3).every(x => x < 0) && values.slice(3, 5).some(x => x >= 0) && (!strict || values.slice(5).every(x => x < 0));
+    const cnDown = values.slice(0, 3).every(x => x < 0), cnUp = values.slice(0, 3).every(x => x >= 0);
+    const forwardDown = values.slice(5).every(x => x < 0), forwardUp = values.slice(5).every(x => x >= 0);
+    const direction = values.slice(3, 5).filter(x => x >= 0).length < overseasRequired ? null
+      : !strict ? (cnDown ? "basic" : null) : cnDown && forwardDown ? "both" : cnDown && forwardUp ? "reverse" : cnUp && forwardDown ? "forward" : null;
     const state = newMonitor(epoch);
-    assert.equal(round(state, cfg, 1, values).some(e => e.type === "blocked"), blocked, `bits ${bits}`);
+    const events = round(state, cfg, 1, values);
+    assert.equal(events.some(e => e.type === "blocked"), Boolean(direction), `bits ${bits}`);
+    assert.equal(events[0]?.direction ?? null, direction, `direction bits ${bits}`);
+    assert.equal(state.alarmDirection, direction);
     const alarm = newMonitor(epoch); alarm.alarm = true; alarm.blockedSince = epoch;
     assert.equal(round(alarm, cfg, 1, values).some(e => e.type === "recovered"), values.every(x => x >= 0), `recovery bits ${bits}`);
   }
+});
+
+test("strict directions confirm independently, notify changes once, and recover only after full healthy rounds", () => {
+  const cfg = { ...config(), strict: true, observers: ["probe-a", "probe-b"], recoveryThreshold: 2 };
+  let s = newMonitor(epoch);
+  const reverse = [-1, -1, -1, 1, 1, 1, 1], forward = [1, 1, 1, 1, 1, -1, -1], both = [-1, -1, -1, 1, 1, -1, -1];
+  assert.deepEqual(round(s, cfg, 1, reverse), []);
+  assert.deepEqual(round(s, cfg, 2, forward), []);
+  assert.equal(s.failureStreak, 1);
+  for (const n of [3, 4]) assert.deepEqual(round(s, cfg, n, reverse), []);
+  const first = round(s, cfg, 5, reverse)[0];
+  assert.equal(first.direction, "reverse");
+  assert.equal(first.previousDirection, undefined);
+  assert.equal(s.alarmDirection, "reverse");
+  const since = s.blockedSince;
+  for (const n of [6, 7]) assert.deepEqual(round(s, cfg, n, both), []);
+  assert.equal(s.alarmDirection, "reverse");
+  assert.equal(s.candidateDirection, "both");
+  s = JSON.parse(JSON.stringify(s));
+  const changed = round(s, cfg, 8, both)[0];
+  assert.equal(changed.type, "blocked");
+  assert.equal(changed.direction, "both");
+  assert.equal(changed.previousDirection, "reverse");
+  assert.equal(changed.since, since);
+  assert.deepEqual(round(s, cfg, 8, both), []);
+  for (const n of [9, 10]) assert.deepEqual(round(s, cfg, n, forward), []);
+  const changedAgain = round(s, cfg, 11, forward)[0];
+  assert.equal(changedAgain.previousDirection, "both");
+  assert.equal(changedAgain.direction, "forward");
+  assert.deepEqual(round(s, cfg, 12, [1, 1, 1, 1, 1, 1, 1]), []);
+  assert.equal(s.alarm, true);
+  const recovered = round(s, cfg, 13, [1, 1, 1, 1, 1, 1, 1])[0];
+  assert.equal(recovered.type, "recovered");
+  assert.equal(recovered.direction, "forward");
+  assert.equal(recovered.since, since);
+  assert.equal(s.alarmDirection, null);
+});
+
+test("partial, missing, stale and all-failed rounds cannot change the confirmed direction", () => {
+  const cfg = { ...config(), strict: true, observers: ["probe-a", "probe-b"], failureThreshold: 1 };
+  const s = newMonitor(epoch);
+  round(s, cfg, 1, [-1, -1, -1, 1, 1, 1, 1]);
+  for (const [i, values] of [[-1, -1, -1, 1, 1, -1, 1], [1, -1, 1, 1, 1, -1, -1], [-1, -1, -1, -1, -1, -1, -1], [1, 1, 1, 1, 1, -1]].entries()) {
+    assert.deepEqual(round(s, cfg, i + 2, values), []);
+    assert.equal(s.alarmDirection, "reverse");
+  }
+  evaluate(s, {}, cfg, "server-a", epoch + 999999);
+  assert.equal(s.health, "unknown");
+  assert.equal(s.candidateDirection, null);
+  assert.equal(s.alarmDirection, "reverse");
+});
+
+test("legacy strict alarms migrate as both without replay, while legacy pending streaks restart safely", () => {
+  const cfg = { ...config(), strict: true, observers: ["probe-a"], failureThreshold: 2 };
+  const s = newMonitor(epoch);
+  s.alarm = true; s.blockedSince = epoch;
+  delete s.alarmDirection; delete s.candidateDirection;
+  s.failureStreak = 1;
+  assert.deepEqual(round(s, cfg, 1, [-1, -1, -1, 1, 1, -1]), []);
+  assert.equal(s.alarmDirection, "both");
+  assert.equal(s.failureStreak, 1);
+  assert.deepEqual(round(s, cfg, 2, [-1, -1, -1, 1, 1, 1]), []);
+  const event = round(s, cfg, 3, [-1, -1, -1, 1, 1, 1])[0];
+  assert.equal(event.previousDirection, "both");
+  assert.equal(event.direction, "reverse");
+  assert.equal(event.since, epoch);
+});
+
+for (const direction of ["basic", "forward", "reverse", "both"] as const) test(`notification state text and direction change (${direction})`, () => {
+  const text = { basic: "疑似被墙", forward: "疑似正向墙", reverse: "疑似反向墙", both: "疑似双向墙" }[direction];
+  const client = { uuid: "server-a", name: "Test server", ipv4: "203.0.113.123", ipv6: "", group: "" };
+  const event = { type: "blocked", direction, at: epoch, since: epoch, mainland: 0, overseas: 2, reverse: 0, reverseTotal: direction === "basic" ? 0 : 2 } as Notice;
+  const initial = notificationEvent(event, client, config());
+  assert.equal(initial.event, "服务器疑似被墙");
+  assert.ok(initial.message.includes(`被墙状态：${text}`));
+  assert.doesNotMatch(initial.message, /说明：|封锁原因|TCP 连通性推断/);
+  const changed = notificationEvent({ ...event, previousDirection: direction === "reverse" ? "both" : "reverse" }, client, config());
+  assert.equal(changed.event, "服务器被墙方向变化");
+  assert.ok(changed.message.includes(` → ${text}`));
+  assert.ok(!changed.message.includes(client.ipv4));
+  assert.doesNotMatch(changed.message, /说明：|封锁原因|TCP 连通性推断/);
+  assert.doesNotMatch(notificationEvent({ ...event, type: "recovered" }, client, config()).message, /说明：|封锁原因|TCP 连通性推断/);
 });

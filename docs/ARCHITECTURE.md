@@ -38,6 +38,12 @@ Komari Ping 任务 ------ 已有 Agent ------ 5 个 TCP 目标
 
 每个服务器有独立的样本游标、健康状态、连续告警/恢复计数、未解除事件和最后处理时间。5 个目标各取一个未消费的新样本，要求处于允许的时间偏差内；任何结果不得被多次消费。遇到过期、查询失败或配置变化，重置连续确认但不解除既有告警。
 
+0.1.5 在满足非大陆成功门槛的完整轮次中分类：普通模式反向全失败为 `basic`；严格模式反向全失败且正向全成功为 `reverse`，反向全成功且正向全失败为 `forward`，双向全失败为 `both`。某方向部分成功不做单向/双向墙推断。严格模式的单向和双向异常均告警，改变此前仅双向失败告警的规则。恢复仍要求所有参与目标连续成功。
+
+schema 1 新增可选 `alarmDirection`（已确认方向）和 `candidateDirection`（正在连续确认的方向），不改变原 `health` / `alarm` 字段。候选方向变化、无效/过期轮次重置连续失败计数；达到阈值才替换已确认方向并创建新的 `blocked` 事件，事件可选 `direction` / `previousDirection` 区分首次告警和方向变更。方向变化保留 `blockedSince`，不插入虚假恢复；取代旧待发通知，保留既有重试/去重规则。正常恢复清除已确认方向，恢复事件记录原方向。
+
+旧版在严格模式下产生的告警只可能为双向，加载时补为 `both`，普通模式补为 `basic`，不重发。若已有事件表明告警在普通模式下产生、之后才开启严格模式，则保留普通表述，等待新证据；历史已按保留期淘汰时，以已保存模式兼容。旧版无候选方向的失败计数在新完整轮次重新开始，避免与新方向混算。暂停/数据不足保留已确认方向，候选清空；关闭严格模式改用 `basic` 表述但保留告警。新的方向字段使用当前用户语义，不沿用下面列出的历史任务键含义。
+
 定时器、配置保存、任务同步、通知发送通过串行执行锁避免重叠。状态和待发送事件在投递前写入双槽校验日志（`state-0.json` / `state-1.json`），成功后保存投递状态。序号和 SHA-256 用于选择完整的最新副本，写入中断时保留另一槽；两槽均损坏时拒绝静默重置。没有变化时跳过写盘。此方案避免本次 Windows 宿主测试遇到的沙箱 `renameSync` 无效句柄问题，不承诺断电级事务或严格 exactly-once 投递。
 
 通知失败最多尝试 5 次并指数退避，超过 24 小时不补发陈旧事件。检测配置变更取消旧待发通知并保留仍被监测服务器的告警标志；仅脱敏开关改变则按最新策略格式化待发消息。正向目标地址因服务器 IP 更新而改变时也重置采样起点，任务源签名随状态持久化。
@@ -91,11 +97,12 @@ HTTP API 显式检查 `req.context.principal.roles` 包含 `admin`，不把 `/ap
 ### 覆盖范围
 
 - `GET /api/task/ping`：标准 REST 包装的任务列表。
+- `GET /api/admin/ping` 与 `/api/admin/ping/`：后台原生任务/服务器视图及任务绑定选择器的完整任务列表。1.6.1 路由桥实际绑定尾斜杠，hook 匹配器却裁剪模式末尾斜杠，故只注册 `GET /api/admin/ping/*` 并在回调精确检查列表路径（允许查询字符串）；不解析其它子路径、不拦截 POST 新增/编辑/删除/排序。
 - `GET /api/records/ping`：任务摘要、记录、`count` 和跨任务 `basic_info`。
-- `POST /api/rpc2`：精确识别 `public:getPublicPingTasks`、`public:getPingRecords`、`public:queryMetrics` 的 `ping.*` 查询、`public:getPingMetricStats`、`common:getRecords` 的 `type: ping` 及 `common:getNodesLatestStatus` 的 `ping` 字典。
+- `POST /api/rpc2`：精确识别 `public:getPublicPingTasks`、`admin:getAllPingTasks`、`public:getPingRecords`、`public:queryMetrics` 的 `ping.*` 查询、`public:getPingMetricStats`、`common:getRecords` 的 `type: ping` 及 `common:getNodesLatestStatus` 的 `ping` 字典。托管配置表单的 Ping 任务选择也使用 `admin:getAllPingTasks`。
 - `GET /api/rpc2` 的 WebSocket：独立 `wsMessage` / `wsSend` / `wsClose`，覆盖文本和二进制 JSON 帧。HTTP hook 不拦截升级请求。
 - 源码核查 `/api/clients` WS、`public:getNodesInformation`、`public:getClientRecentRecords`、`public:getRecordsByUUID`、`common:getNodes`、`common:getNodeRecentStatus` 和指标定义列表：不输出逐任务 Ping 数据，无需全局扫描这些响应。
-- 不拦截 Agent v2 的调度/上报，不拦截 `admin:getAllPingTasks`、管理员数据库/备份及本插件配置/总览。其它插件若以公开自有路由转发 `server.call()` 原始数据，无法由这组限定路径钩子保证隐藏。
+- 不拦截 Agent v2 的调度/上报、管理员数据库/备份及本插件配置/总览。其它插件若以自有路由转发 `server.call()` 原始数据，无法由这组限定路径钩子保证隐藏。正常前后台任务列表均过滤，但不把特权数据库查询任意改写成虚假数据。
 
 HTTP 响应 hook 中 `req.body` 恒为空，不能据响应形状猜 RPC 方法。请求 hook 只对上述方法生成唯一临时 wire ID，保留原 ID 与过滤种类；响应精确关联后恢复 ID。批量请求混合方法、相同原始 ID、乱序回复、单元素批量返回对象、数字/字符串/null/无 ID 均有测试。保留宿主错误，不改变其它方法结果；无关 HTTP RPC 不解析其响应。HTTP 临时关联用被覆盖的内部请求头定位，不信任客户端提供的该头；不保存 Cookie、正文或凭据。
 
@@ -119,16 +126,16 @@ HTTP 响应 hook 中 `req.body` 恒为空，不能据响应形状猜 RPC 方法�
 
 ### 性能与无法保证的情况
 
-只为上述三个路径注册 HTTP hooks，不全局缓冲 HTTP；只为 `/api/rpc2` 注册 WS hooks，不触碰 Agent 通道。普通过滤为 O(任务数 + 记录数)，归属查找用 Set；需要下采样时排序为 O(n log n)。历史查询需完整的宿主返回结果才能修复汇总，因此临时内存和返回给钩子的记录数可能高于原本的限点查询；建议缩短大量节点的历史查询时间范围。插件不在 hook 中查询数据库/调用异步 RPC，也不把延迟数据另行存盘。
+只为上述四个路径范围注册 HTTP hooks，不全局缓冲 HTTP；后台列表匹配仅限 GET，其它子路径回调直接返回。只为 `/api/rpc2` 注册 WS hooks，不触碰 Agent 通道。普通过滤为 O(任务数 + 记录数)，归属查找用 Set；需要下采样时排序为 O(n log n)。历史查询需完整的宿主返回结果才能修复汇总，因此临时内存和返回给钩子的记录数可能高于原本的限点查询；建议缩短大量节点的历史查询时间范围。插件不在 hook 中查询数据库/调用异步 RPC，也不把延迟数据另行存盘。
 
 **原生钩子是尽力输出改写，不是授权隔离：**
 
 - HTTP 缓冲固定 32 MiB；超限直接透传。`Flush()` 进入流式透传。宿主仅凭 `Connection: Upgrade` 与非空 `Upgrade` 头就跳过 HTTP hooks；**普通 REST 端点带升级头也能旁路，不要求实际建立 WebSocket**。隔离宿主测试对此保留反例断言，不能把它作为严格隔离已修复。`maxHTTPBodyBytes` 只约束请求读取等，不提高响应上限。
 - HTTP response hook 超时/异常继续原响应；WS 单帧超过 8 MiB 或处理超过 1 秒原样通过。由于这些是宿主主动绕过，插件不能保证拒绝或可靠上报每次旁路。超大 RPC 透传还可能携带临时 wire ID，而非原 ID。
 - 插件禁用、审批失效、卸载、启动/停止窗口、其它插件后置改写以及未来新增端点可能暴露原生数据。已缓存的旧响应不能追溯撤回；修改后的 HTTP 响应使用 `no-store` 并移除旧 ETag。
-- 管理员数据库、备份、原生任务管理与其它插件直接 RPC 仍能读取原数据，符合其特权用途，不承诺对管理员隔离。
+- 管理员数据库、备份与其它插件直接 RPC 仍能读取原数据，符合其特权用途，不承诺对管理员隔离；普通原生任务管理读取自 0.1.5 起也过滤。
 
-因此 0.1.3 能在已验证普通 API 场景隐藏内部数据，但**未达到无条件、所有传输/体积/运行状态下绝不暴露的目标**。不能把“前端不显示”描述为安全边界已修复。
+因此 0.1.5 能在已覆盖的普通前后台 API 场景隐藏内部数据，但**未达到无条件、所有传输/体积/运行状态下绝不暴露的目标**。不能把“前端不显示”描述为安全边界已修复。
 
 ### 仅改插件的替代路线
 
@@ -142,10 +149,13 @@ HTTP 响应 hook 中 `req.body` 恒为空，不能据响应形状猜 RPC 方法�
 
 ## 官方依据
 
-核验日期：2026-11-03；以下源码固定到 1.6.1，不以滚动主分支保证兼容性。
+核验日期：2026-11-04；以下源码固定到 1.6.1，不以滚动主分支保证兼容性。
 
 - [插件指南](https://komari-monitor.github.io/komari-document/dev/plugin/index)
 - [Ping RPC](https://github.com/komari-monitor/komari/blob/1.6.1/web/rpc/jsonrpc/admin.ping.go)
+- [REST 路由绑定](https://github.com/komari-monitor/komari/blob/1.6.1/web/router/router.go)
+- [后台任务数据源](https://github.com/komari-monitor/komari-web/blob/1.6.1/src/contexts/PingTaskContext.tsx)
+- [后台服务器视图与任务绑定保存](https://github.com/komari-monitor/komari-web/blob/1.6.1/src/pages/admin/pingTask_Server.tsx)
 - [完整服务器列表与删除 RPC](https://github.com/komari-monitor/komari/blob/1.6.1/web/rpc/jsonrpc/admin.client.go)
 - [指标查询](https://github.com/komari-monitor/komari/blob/1.6.1/web/rpc/jsonrpc/public.metric.go)
 - [旧查询的 rollup 路径](https://github.com/komari-monitor/komari/blob/1.6.1/internal/metricstore/ping_records.go)

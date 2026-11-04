@@ -1,9 +1,10 @@
 import { monitorKeys } from "./config.ts";
-import type { Config, Evidence, Monitor, Sample, Transition } from "./types.ts";
+import type { BlockDirection, Config, Evidence, Monitor, Sample, Transition } from "./types.ts";
 
 export function newMonitor(now: number, previous?: Monitor): Monitor {
   return {
     health: "initializing", alarm: previous?.alarm ?? false,
+    alarmDirection: previous?.alarm ? previous.alarmDirection ?? null : null, candidateDirection: null,
     blockedSince: previous?.blockedSince ?? null, suspectSince: null,
     failureStreak: 0, recoveryStreak: 0, after: {}, latest: {}, lastRoundAt: null, effectiveSince: now,
   };
@@ -12,10 +13,13 @@ export function resetStreaks(state: Monitor): void {
   state.failureStreak = 0;
   state.recoveryStreak = 0;
   state.suspectSince = null;
+  state.candidateDirection = null;
 }
 export function staleAfter(config: Config): number { return config.intervalSeconds * 2000 + 15000; }
 
 export function evaluate(state: Monitor, samples: Record<string, Sample[]>, config: Config, uuid: string, now: number): Transition[] {
+  // Pre-0.1.5 strict alarms could only be bidirectional. Keep them without replay.
+  state.alarmDirection = state.alarm ? state.alarmDirection ?? (config.strict ? "both" : "basic") : null;
   const keys = monitorKeys(config, uuid);
   const events: Transition[] = [];
   const skew = Math.min(15000, config.intervalSeconds * 450);
@@ -52,26 +56,40 @@ export function evaluate(state: Monitor, samples: Record<string, Sample[]>, conf
       reverse: keys.filter(k => k.startsWith("reverse:") && round[k].value >= 0).length,
       reverseTotal: keys.filter(k => k.startsWith("reverse:")).length,
     };
-    const blocked = evidence.mainland === 0 && evidence.overseas >= config.overseasRequired && evidence.reverse === 0;
+    let direction: BlockDirection | null = null;
+    if (evidence.overseas >= config.overseasRequired) {
+      if (!config.strict) direction = evidence.mainland === 0 ? "basic" : null;
+      else if (evidence.reverseTotal > 0) {
+        if (evidence.mainland === 0 && evidence.reverse === 0) direction = "both";
+        else if (evidence.mainland === 0 && evidence.reverse === evidence.reverseTotal) direction = "reverse";
+        else if (evidence.mainland === 3 && evidence.reverse === 0) direction = "forward";
+      }
+    }
     const healthy = evidence.mainland === 3 && evidence.overseas === 2 && evidence.reverse === evidence.reverseTotal;
-    if (blocked) {
+    if (direction) {
       state.health = "suspect";
+      if (state.candidateDirection !== direction) { state.failureStreak = 0; state.suspectSince = null; }
+      state.candidateDirection = direction;
       state.failureStreak++;
       state.recoveryStreak = 0;
       state.suspectSince ??= min;
-      if (!state.alarm && state.failureStreak >= config.failureThreshold) {
+      if ((!state.alarm || state.alarmDirection !== direction) && state.failureStreak >= config.failureThreshold) {
+        const previousDirection = state.alarm ? state.alarmDirection! : undefined;
         state.alarm = true;
-        state.blockedSince = state.suspectSince;
-        events.push({ ...evidence, type: "blocked", at: max, since: state.blockedSince });
+        state.alarmDirection = direction;
+        state.blockedSince ??= state.suspectSince;
+        events.push({ ...evidence, type: "blocked", direction, ...(previousDirection ? { previousDirection } : {}), at: max, since: state.blockedSince });
       }
     } else if (healthy) {
       state.health = "healthy";
       state.failureStreak = 0;
       state.suspectSince = null;
+      state.candidateDirection = null;
       state.recoveryStreak++;
       if (state.alarm && state.recoveryStreak >= config.recoveryThreshold) {
-        events.push({ ...evidence, type: "recovered", at: max, since: state.blockedSince ?? max });
+        events.push({ ...evidence, type: "recovered", direction: state.alarmDirection!, at: max, since: state.blockedSince ?? max });
         state.alarm = false;
+        state.alarmDirection = null;
         state.blockedSince = null;
       }
     } else {

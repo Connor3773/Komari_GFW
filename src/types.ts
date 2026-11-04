@@ -23,9 +23,12 @@ export interface PingTask {
 }
 export interface Sample { at: number; value: number }
 export type Health = "initializing" | "healthy" | "suspect" | "degraded" | "outage" | "unknown" | "paused";
+export type BlockDirection = "basic" | "forward" | "reverse" | "both";
 export interface Monitor {
   health: Health;
   alarm: boolean;
+  alarmDirection?: BlockDirection | null;
+  candidateDirection?: BlockDirection | null;
   blockedSince: number | null;
   suspectSince: number | null;
   failureStreak: number;
@@ -36,7 +39,10 @@ export interface Monitor {
   effectiveSince: number;
 }
 export interface Evidence { mainland: number; overseas: number; reverse: number; reverseTotal: number }
-export interface Transition extends Evidence { type: "blocked" | "recovered"; at: number; since: number }
+export interface Transition extends Evidence {
+  type: "blocked" | "recovered"; at: number; since: number;
+  direction?: BlockDirection; previousDirection?: BlockDirection;
+}
 export interface Notice extends Transition {
   id: string; client: string; attempts: number; nextAttemptAt: number;
   delivery: "pending" | "sent" | "failed" | "superseded";

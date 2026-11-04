@@ -26,11 +26,24 @@ function fixture() {
     if (fail) throw new Error("Network unavailable");
     return { ok: true };
   };
-  return { banner, error, calls, timers, document, render: (value: unknown) => context.renderSelectionNotice(value),
+  return { banner, error, calls, timers, document, context, render: (value: unknown) => context.renderSelectionNotice(value),
     fail: (value: boolean) => { fail = value; },
     expire: () => { const jobs = [...timers.values()]; timers.clear(); for (const timer of jobs) timer.fn(); },
   };
 }
+
+test("overview distinguishes directional, pending and legacy event labels", () => {
+  const { context } = fixture();
+  for (const [direction, text] of [["forward", "疑似正向墙"], ["reverse", "疑似反向墙"], ["both", "疑似双向墙"], ["basic", "疑似被墙"]]) {
+    assert.equal(context.eventText({ type: "blocked", direction }), text);
+    assert.equal(context.observationText({ health: "suspect", candidateDirection: direction }), `${text}条件`);
+  }
+  assert.equal(context.eventText({ type: "blocked", direction: "forward", previousDirection: "reverse" }), "方向变化：疑似反向墙 → 疑似正向墙");
+  assert.equal(context.eventText({ type: "blocked", reverseTotal: 2 }), "疑似双向墙");
+  assert.equal(context.eventText({ type: "blocked", reverseTotal: 0 }), "疑似被墙");
+  assert.equal(context.eventText({ type: "recovered", direction: "both" }), "解除被墙状态");
+  assert.equal(context.observationText({ health: "unknown", candidateDirection: "reverse" }), "数据不足");
+});
 
 test("selection notice is shown once, acknowledged, expires in 8 seconds and does not hide real errors", async () => {
   const f = fixture();

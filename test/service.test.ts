@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { initialState, notificationReadiness, Service } from "../src/service.ts";
 import type { MetricSeries, Notice, PingTask, Rpc, State } from "../src/types.ts";
 import { validateConfig } from "../src/config.ts";
-import { filterResult, TaskVisibility } from "../src/visibility.ts";
+import { filterResult, PingResponseFilter, TaskVisibility } from "../src/visibility.ts";
 
 function fixture() {
   let now = Date.parse("2026-01-01T00:00:00Z"), id = 0;
@@ -42,7 +42,19 @@ function fixture() {
 for (const strict of [false, true]) test(`visibility survives lifecycle without filtering internal RPC (strict=${strict})`, async () => {
   const f = fixture();
   await f.service.saveConfig({ ...f.service.state.config, clients: ["a"], enabled: true, strict, observers: ["observer"], reverse: { a: { port: 443, host: "" } }, failureThreshold: 1, recoveryThreshold: 1 }, 0);
-  const assertHidden = () => assert.deepEqual(filterResult(structuredClone(f.tasks), { kind: "tasks" }, f.service.visibility), [f.tasks[0]]);
+  const hooks = new Map<string, (...args: any[]) => any>();
+  new PingResponseFilter(f.service.visibility, "lifecycle").register({ hook(kind, matcher, callback) { hooks.set(`${kind} ${matcher}`, callback); } });
+  const assertHidden = () => {
+    assert.deepEqual(filterResult(structuredClone(f.tasks), { kind: "tasks" }, f.service.visibility), [f.tasks[0]]);
+    const res = { statusCode: 200, headers: {}, body: JSON.stringify({ status: "success", data: f.tasks }) };
+    hooks.get("response GET /api/admin/ping/*")!({ url: "/api/admin/ping/" }, res);
+    assert.deepEqual(JSON.parse(res.body).data, [f.tasks[0]]);
+    const req = { body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "admin:getAllPingTasks" }), headers: {} };
+    hooks.get("request POST /api/rpc2")!(req);
+    const response = { statusCode: 200, headers: {}, body: JSON.stringify({ jsonrpc: "2.0", id: JSON.parse(req.body).id, result: f.tasks }) };
+    hooks.get("response POST /api/rpc2")!(req, response);
+    assert.deepEqual(JSON.parse(response.body).result, [f.tasks[0]]);
+  };
   assertHidden();
   f.setRound([-1, -1, -1, 1, 1], { a: -1 }); await f.service.tick();
   assert.equal(f.service.snapshot().rows[0].alarm, true);
@@ -399,9 +411,52 @@ test("end-to-end service detects one event, persists before sending and redacts"
 test("strict mainland-to-server samples belong to the monitored server, not the observer", async () => {
   const f = fixture();
   await f.service.saveConfig({ ...f.service.state.config, clients: ["a"], enabled: true, strict: true, observers: ["observer"], reverse: { a: { port: 443, host: "" } }, failureThreshold: 1, recoveryThreshold: 1 }, 0);
-  f.setRound([-1, -1, -1, 1, 1], { a: 10 }); await f.service.tick(); assert.equal(f.service.state.events.length, 0);
-  f.setRound([-1, -1, -1, 1, 1], { a: -1 }); await f.service.tick(); assert.equal(f.service.state.events[0].type, "blocked");
-  f.setRound([1, 1, 1, 1, 1], { a: 1 }); await f.service.tick(); assert.equal(f.service.state.events[1].type, "recovered");
+  f.setRound([-1, -1, -1, 1, 1], { a: 10 }); await f.service.tick(); assert.equal(f.service.state.events[0].direction, "reverse");
+  f.setRound([-1, -1, -1, 1, 1], { a: -1 }); await f.service.tick(); assert.equal(f.service.state.events[1].direction, "both");
+  assert.equal(f.service.state.events[1].previousDirection, "reverse");
+  f.setRound([1, 1, 1, 1, 1], { a: 1 }); await f.service.tick(); assert.equal(f.service.state.events[2].type, "recovered");
+});
+
+test("direction transitions supersede pending delivery and survive pause/reload without duplicate notifications", async () => {
+  const f = fixture(); f.fail();
+  await f.service.saveConfig({ ...f.service.state.config, clients: ["a"], enabled: true, strict: true, observers: ["observer"], reverse: { a: { port: 443, host: "" } }, failureThreshold: 1, recoveryThreshold: 1 }, 0);
+  f.setRound([-1, -1, -1, 1, 1], { a: 1 }); await f.service.tick();
+  assert.equal(f.saved().events[0].delivery, "pending");
+  f.setRound([1, 1, 1, 1, 1], { a: -1 }); await f.service.tick();
+  assert.equal(f.saved().events[0].delivery, "superseded");
+  assert.equal(f.saved().events[1].direction, "forward");
+  assert.equal(f.saved().events[1].previousDirection, "reverse");
+  assert.equal(f.service.snapshot().rows[0].alarmDirection, "forward");
+  await f.service.saveConfig({ ...f.service.state.config, enabled: false }, 1);
+  assert.equal(f.service.snapshot().rows[0].health, "paused");
+  assert.equal(f.service.snapshot().rows[0].alarmDirection, "forward");
+  assert.equal(f.service.snapshot().rows[0].candidateDirection, null);
+  const restored = new Service(structuredClone(f.saved()), f.rpc, { save() {} }, f.now);
+  await restored.saveConfig({ ...restored.state.config, enabled: true }, 2);
+  f.setRound([1, 1, 1, 1, 1], { a: -1 }); await restored.tick();
+  assert.equal(restored.state.events.length, 2);
+  assert.equal(restored.snapshot().rows[0].alarmDirection, "forward");
+  f.removeClient("observer");
+  await restored.tick();
+  assert.equal(restored.state.config.strict, false);
+  assert.equal(restored.state.config.enabled, true);
+  assert.equal(restored.snapshot().rows[0].alarmDirection, "basic");
+  assert.equal(restored.state.events.length, 2);
+});
+
+test("legacy basic alarm carried into strict mode is not relabeled as observed bidirectional failure", async () => {
+  const f = fixture();
+  await f.service.saveConfig({ ...f.service.state.config, clients: ["a"], enabled: true, failureThreshold: 1 }, 0);
+  f.setRound([-1, -1, -1, 1, 1]); await f.service.tick();
+  await f.service.saveConfig({ ...f.service.state.config, strict: true, observers: ["observer"], reverse: { a: { port: 443, host: "" } } }, 1);
+  const legacy = structuredClone(f.saved());
+  delete legacy.monitors.a.alarmDirection;
+  delete legacy.monitors.a.candidateDirection;
+  delete legacy.events[0].direction;
+  const restored = new Service(legacy, f.rpc, { save() {} }, f.now);
+  assert.equal(restored.snapshot().rows[0].alarmDirection, "basic");
+  assert.equal(restored.state.events.length, 1);
+  assert.equal(restored.state.monitors.a.blockedSince, legacy.events[0].since);
 });
 test("aggregated metrics cannot trigger or clear an alarm", async () => {
   const f = fixture();

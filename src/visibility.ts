@@ -228,7 +228,7 @@ export class PingResponseFilter {
       const method = field(req, "method", true);
       const params = field(req, "params");
       let selection: Selection | undefined;
-      if (method === "public:getPublicPingTasks") selection = { kind: "tasks" };
+      if (method === "public:getPublicPingTasks" || method === "admin:getAllPingTasks") selection = { kind: "tasks" };
       else if (method === "public:queryMetrics") {
         const keys = [param(params, "metric_key", 0), param(params, "metric_keys", 1), param(params, "metrics", 2)].flat();
         if (keys.some(key => typeof key === "string" && key.trim().startsWith("ping."))) selection = { kind: "metrics" };
@@ -299,6 +299,11 @@ export class PingResponseFilter {
   register(server: HookServer): void {
     // Only these paths are buffered. server.call() never traverses HTTP/WS hooks.
     server.hook("response", "GET /api/task/ping", (_req: HookRequest, res: HookResponse) => this.rest(res, { kind: "tasks" }));
+    // 1.6.1 serves the admin list at /ping/ but strips trailing slashes from exact
+    // hook matchers. Use a GET-only subtree matcher and guard the actual list URL.
+    server.hook("response", "GET /api/admin/ping/*", (req: HookRequest, res: HookResponse) => {
+      if (/^\/api\/admin\/ping\/?(?:\?|$)/i.test(req.url)) this.rest(res, { kind: "tasks" });
+    });
     server.hook("request", "GET /api/records/ping", (req: HookRequest) => {
       delete req.headers[HEADER];
       // The REST bridge accepts a JSON GET body. Normal requests have no sample cap.

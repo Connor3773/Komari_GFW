@@ -21,7 +21,7 @@ const listeners = [];
 let hook;
 const notifications = [];
 // Legacy titles are accepted only for the pre-upgrade portion of this harness.
-const pluginTitles = new Set(["GFW 测试通知", "GFW 疑似被墙", "GFW 解除被墙状态", "被墙检测测试通知", "服务器疑似被墙", "服务器解除被墙状态"]);
+const pluginTitles = new Set(["GFW 测试通知", "GFW 疑似被墙", "GFW 解除被墙状态", "被墙检测测试通知", "服务器疑似被墙", "服务器被墙方向变化", "服务器解除被墙状态"]);
 const pluginMessages = () => notifications.filter(body => { try { return pluginTitles.has(JSON.parse(body).title); } catch { return false; } });
 function verifyNotificationCopy() {
   const [blocked, recovered] = pluginMessages().slice(-2).map(body => JSON.parse(body));
@@ -57,6 +57,18 @@ async function json(path, body, authenticated = true) {
 }
 async function rpc(method, params) {
   return (await json("/api/rpc2", { jsonrpc: "2.0", method, params: params ?? {}, id: 1 })).result;
+}
+async function rawTasks() {
+  // Test-only privileged oracle on the disposable SQLite host. Ordinary admin
+  // lists are filtered too; do not add a raw-data route to the shipped plugin.
+  const result = await rpc("admin:dbQuery", { database: "main", sql: "SELECT id, weight, name, clients, all_clients AS default_on, type, target, interval FROM ping_tasks ORDER BY weight, id", limit: 1000 });
+  assert.equal(result.truncated, false);
+  return result.rows.map(values => {
+    const task = Object.fromEntries(result.columns.map((key, i) => [key, values[i]]));
+    task.clients = JSON.parse(task.clients || "[]");
+    task.default_on = Boolean(task.default_on);
+    return task;
+  });
 }
 async function plugin(path, body) { return json("/api/admin/plugins/komari-gfw/" + path, body); }
 async function install(zip) {
@@ -131,12 +143,12 @@ try {
   let cfg = { ...settings.config, enabled: true, strict: true, intervalSeconds: 30, failureThreshold: 1, recoveryThreshold: 1, clients: [monitored.uuid], observers: agents.slice(1).map(a => a.uuid), reverse: { [monitored.uuid]: { host: "127.0.0.1", port: ports[5].port } }, targets: settings.config.targets.map((t, i) => ({ ...t, address: `127.0.0.1:${ports[i].port}` })) };
   settings = await plugin("settings", { config: cfg, revision: settings.revision });
   assert.equal(settings.lastError, "");
-  const tasks = await rpc("admin:getAllPingTasks"); assert.equal(tasks.length, 6);
+  const tasks = await rawTasks(); assert.equal(tasks.length, 6);
   const reverseTask = tasks.find(t => t.name.includes(":reverse:"));
   assert.equal(reverseTask.clients.length, 2);
   async function cycle() {
     const started = Date.now();
-    for (const task of (await rpc("admin:getAllPingTasks")).filter(t => t.name.startsWith("[Komari GFW:"))) {
+    for (const task of (await rawTasks()).filter(t => t.name.startsWith("[Komari GFW:"))) {
       const targetPort = Number(task.target.split(":").at(-1));
       for (const uuid of task.clients) {
         const agent = agents.find(a => a.uuid === uuid);
@@ -157,14 +169,10 @@ try {
     console.log("METRIC SHAPE:", result.series?.map(s => ({ downsampled: s.downsampled, points: s.points?.length, sample: s.points?.[0], tags: s.tags })));
   }
   assert.equal(overview.rows[0].health, "healthy"); assert.equal(overview.rows[0].alarm, false);
-  for (const item of ports.slice(0, 3)) await new Promise(r => item.listener.close(r));
-  overview = await cycle(); assert.equal(overview.rows[0].alarm, false);
-  await new Promise(r => ports[5].listener.close(r));
+  for (const i of [0, 1, 2, 5]) await new Promise(r => ports[i].listener.close(r));
   overview = await cycle(); assert.equal(overview.rows[0].alarm, true);
   assert.equal(overview.events[0].type, "blocked");
-  for (const item of ports.slice(0, 3)) item.listener = await tcpServer(item.port);
-  overview = await cycle(); assert.equal(overview.rows[0].alarm, true);
-  ports[5].listener = await tcpServer(ports[5].port);
+  for (const i of [0, 1, 2, 5]) ports[i].listener = await tcpServer(ports[i].port);
   overview = await cycle(); assert.equal(overview.rows[0].alarm, false);
   assert.equal(overview.events[0].type, "recovered");
   assert.equal(pluginMessages().length, 3);
@@ -173,17 +181,21 @@ try {
   if (!process.env.KOMARI_TEST_UPGRADE_FROM) verifyNotificationCopy();
   console.log("PASS: loopback TCP, v2 ingestion, raw metrics, two mainland observers, block/recovery and system Webhook");
   await rpc("admin:setPluginEnabled", { short: "komari-gfw", enabled: false });
-  assert.ok((await rpc("admin:getAllPingTasks")).every(t => !t.clients.length));
+  assert.ok((await rawTasks()).every(t => !t.clients.length));
   await rpc("admin:setPluginEnabled", { short: "komari-gfw", enabled: true, approved: true });
   overview = await plugin("overview"); assert.equal(overview.events.length, 2);
   assert.equal(pluginMessages().length, 3);
   await cycle();
   console.log("PASS: unload pause, reload persistence and notification deduplication");
   if (process.env.KOMARI_TEST_UPGRADE_FROM) {
+    for (const i of [0, 1, 2, 5]) await new Promise(r => ports[i].listener.close(r));
+    const beforeAlarm = await cycle();
+    assert.equal(beforeAlarm.rows[0].alarm, true);
+    const blockedSince = beforeAlarm.rows[0].blockedSince;
     const removed = await rpc("admin:addClient", { name: "Deleted before upgrade" });
     let before = await plugin("settings");
     before = await plugin("settings", { config: { ...before.config, clients: [...before.config.clients, removed.uuid], reverse: { ...before.config.reverse, [removed.uuid]: { host: "127.0.0.1", port: ports[5].port } } }, revision: before.revision });
-    const beforeTasks = await rpc("admin:getAllPingTasks");
+    const beforeTasks = await rawTasks();
     await rpc("admin:removeClient", { uuid: removed.uuid });
     await install(zip);
     const expected = structuredClone(before.config);
@@ -193,17 +205,25 @@ try {
     assert.deepEqual(repaired.config, expected);
     assert.equal(repaired.lastError, "");
     assert.match(repaired.selectionNotice, /已删除的受检服务器/);
-    assert.equal((await plugin("overview")).events.length, 2);
-    assert.equal(pluginMessages().length, 3);
-    assert.deepEqual((await rpc("admin:getAllPingTasks")).map(t => t.id).sort(), beforeTasks.filter(t => !t.name.endsWith(`:reverse:${removed.uuid}]`)).map(t => t.id).sort());
-    await cycle();
-    console.log("PASS: upgrade repairs deleted selection while retaining surviving configuration, notification history and task identities");
+    const restoredAlarm = await plugin("overview");
+    assert.equal(restoredAlarm.events.length, 3);
+    assert.equal(restoredAlarm.rows[0].alarm, true);
+    assert.equal(restoredAlarm.rows[0].alarmDirection, "both");
+    assert.equal(restoredAlarm.rows[0].blockedSince, blockedSince);
+    assert.equal(pluginMessages().length, 4);
+    assert.deepEqual((await rawTasks()).map(t => t.id).sort(), beforeTasks.filter(t => !t.name.endsWith(`:reverse:${removed.uuid}]`)).map(t => t.id).sort());
+    for (const i of [0, 1, 2, 5]) ports[i].listener = await tcpServer(ports[i].port);
+    const recoveredAlarm = await cycle();
+    assert.equal(recoveredAlarm.rows[0].alarm, false);
+    assert.equal(recoveredAlarm.events[0].direction, "both");
+    assert.equal(pluginMessages().length, 5);
+    console.log("PASS: upgrade repairs deleted selection, preserves task IDs and migrates an active legacy strict alarm as both without replay");
     await plugin("settings", { config: repaired.config, revision: repaired.revision });
     for (const i of [0, 1, 2, 5]) await new Promise(r => ports[i].listener.close(r));
     overview = await cycle(); assert.equal(overview.rows[0].alarm, true);
     for (const i of [0, 1, 2, 5]) ports[i].listener = await tcpServer(ports[i].port);
     overview = await cycle(); assert.equal(overview.rows[0].alarm, false);
-    assert.equal(pluginMessages().length, 5);
+    assert.equal(pluginMessages().length, 7);
     verifyNotificationCopy();
     console.log("PASS: post-upgrade alerts use the new titles and corrected direction evidence");
   }
@@ -276,7 +296,7 @@ try {
   assert.ok(bypassed.data.some(t => t.name.startsWith("[Komari GFW:")));
   console.log("VERIFIED LIMITATION: Upgrade headers bypass HTTP hooks even on the ordinary REST task endpoint");
   async function verifyVisibility() {
-    const ownedIds = new Set((await rpc("admin:getAllPingTasks")).filter(t => t.name.startsWith("[Komari GFW:")).map(t => String(t.id)));
+    const ownedIds = new Set((await rawTasks()).filter(t => t.name.startsWith("[Komari GFW:")).map(t => String(t.id)));
     const metricParams = { metric_keys: ["ping.latency_ms", "ping.loss"], entity_ids: ["retention-fixture"], hours: 1, fill_empty: false, max_points: 4000 };
     const requests = [
       ["public:getPublicPingTasks", {}],
@@ -289,7 +309,7 @@ try {
     ];
     const assertClean = (method, value) => {
       assert.ok(!JSON.stringify(value).includes("[Komari GFW:"), method);
-      if (method === "public:getPublicPingTasks") assert.deepEqual(value.map(t => t.id), [userTask.task_id]);
+      if (method === "public:getPublicPingTasks" || method === "admin:getAllPingTasks") assert.deepEqual(value.map(t => t.id), [userTask.task_id]);
       if (method === "public:getPingRecords" || method === "common:getRecords") {
         assert.equal(value.count, value.records.length);
         assert.equal(value.count, 1, method);
@@ -327,20 +347,29 @@ try {
       assert.ok(history.records.every(r => r.task_id === userTask.task_id));
       assert.equal(history.count, history.records.length);
     }
+    const ordinary = (await rawTasks()).find(t => t.id === userTask.task_id);
+    for (const path of ["/api/admin/ping", "/api/admin/ping/", "/api/admin/ping/?check=visibility"]) {
+      assert.deepEqual((await json(path)).data, [ordinary]);
+      const denied = await fetch(base + path);
+      assert.ok([401, 403].includes(denied.status));
+    }
+    assert.deepEqual(await rpc("admin:getAllPingTasks"), [ordinary]);
     const batch = await json("/api/rpc2", [
       { jsonrpc: "2.0", method: "public:getPublicPingTasks", id: 10 },
       { jsonrpc: "2.0", method: "admin:getAllPingTasks", id: 10 },
       { jsonrpc: "2.0", method: "public:getVersion", id: "version" },
     ]);
     assert.deepEqual(batch[0].result.map(t => t.id), [userTask.task_id]);
-    assert.ok(batch[1].result.some(t => ownedIds.has(String(t.id))));
+    assert.deepEqual(batch[1].result, [ordinary]);
+    assert.deepEqual(batch[2].result, hostVersion);
     assert.deepEqual(batch.map(r => r.id), [10, 10, "version"]);
     // Use a same-origin browser client: the host correctly rejects anonymous
     // native WebSockets without Origin. Do not weaken its Origin policy for tests.
-    const wsPage = await browser.newPage();
+    const wsContext = await browser.newContext();
+    const wsPage = await wsContext.newPage();
     await wsPage.goto(base + "/api/version");
     try {
-      const replies = await wsPage.evaluate(async ({ requests }) => {
+      const readSocket = requests => wsPage.evaluate(async ({ requests }) => {
         const ws = new WebSocket(location.origin.replace("http:", "ws:") + "/api/rpc2");
         await new Promise((resolveOpen, reject) => { ws.onopen = resolveOpen; ws.onerror = () => reject(new Error("WebSocket handshake failed")); });
         const results = [];
@@ -357,16 +386,19 @@ try {
           return results;
         } finally { ws.close(); }
       }, { requests });
+      const replies = await readSocket(requests);
+      await wsContext.addCookies([{ name: "session_token", value: cookie.split("=")[1], url: base }]);
+      replies.push(...await readSocket([...requests, ["admin:getAllPingTasks", {}]]));
       for (const { method, message } of replies) {
         assert.equal(message.id, "ws-id");
         assert.ok(!message.error, JSON.stringify(message.error));
         assertClean(method, message.result);
       }
-    } finally { await wsPage.close(); }
+    } finally { await wsContext.close(); }
     const state = await plugin("overview");
     assert.equal(state.visibilityError, "");
     if (state.enabled) assert.ok(state.rows[0].samples.every(s => s.at !== null));
-    console.log(`PASS: public REST, HTTP RPC mixed batches, text/binary WebSocket, user history/stats and internal samples (${Date.now() - starts} ms)`);
+    console.log(`PASS: public/admin REST, HTTP RPC mixed batches, anonymous/admin text/binary WebSocket, user history/stats and internal samples (${Date.now() - starts} ms)`);
   }
   browser = await chromium.launch({ channel: "msedge", headless: true });
   await verifyVisibility();
@@ -375,6 +407,71 @@ try {
   const errors = []; context.on("page", p => p.on("pageerror", error => errors.push(error.message)));
   const page = await context.newPage();
   const overviewPath = "/admin/plugin-page?short=komari-gfw&file=pages%2Foverview.html";
+  const directionalStart = pluginMessages().length;
+  for (const [direction, changedPorts, opening] of [["reverse", [0, 1, 2], false], ["both", [5], false], ["forward", [0, 1, 2], true], [null, [5], true]]) {
+    for (const i of changedPorts) {
+      if (opening) ports[i].listener = await tcpServer(ports[i].port);
+      else await new Promise(r => ports[i].listener.close(r));
+    }
+    const result = await cycle();
+    assert.equal(result.rows[0].alarm, Boolean(direction));
+    assert.equal(result.rows[0].alarmDirection, direction);
+    const expected = { reverse: "疑似反向墙", both: "疑似双向墙", forward: "疑似正向墙" }[direction];
+    await page.goto(base + overviewPath);
+    const matrix = page.frameLocator("iframe.km-plugin-frame").locator("#matrix");
+    await matrix.getByText(expected ?? "正常", { exact: true }).waitFor();
+    if (direction) await page.screenshot({ path: join(root, `direction-${direction}.png`), fullPage: true });
+  }
+  const directionalNotices = pluginMessages().slice(directionalStart).map(body => JSON.parse(body));
+  assert.deepEqual(directionalNotices.map(n => n.title), ["服务器疑似被墙", "服务器被墙方向变化", "服务器被墙方向变化", "服务器解除被墙状态"]);
+  for (const [index, text] of ["疑似反向墙", "疑似双向墙", "疑似正向墙", "已解除"].entries()) {
+    assert.ok(directionalNotices[index].message.includes(`被墙状态：${text}`));
+    assert.ok(!directionalNotices[index].message.includes("203.0.113.25"));
+    assert.doesNotMatch(directionalNotices[index].message, /说明：|封锁原因|TCP 连通性推断/);
+  }
+  assert.ok(directionalNotices[1].message.includes("状态变化：疑似反向墙 → 疑似双向墙"));
+  assert.ok(directionalNotices[2].message.includes("状态变化：疑似双向墙 → 疑似正向墙"));
+  console.log("PASS: live reverse/both/forward classifications, overview labels, direction-change Webhooks and full recovery");
+
+  const rawBeforeEdit = await rawTasks();
+  const ownBeforeEdit = rawBeforeEdit.filter(t => t.name.startsWith("[Komari GFW:"));
+  const userBeforeEdit = rawBeforeEdit.find(t => t.id === userTask.task_id);
+  await page.goto(base + "/admin/ping");
+  const taskView = page.locator(".km-pingtask-task-table");
+  await taskView.getByText(userBeforeEdit.name, { exact: true }).waitFor();
+  assert.equal(await taskView.locator("tbody tr").count(), 1);
+  assert.ok(!(await taskView.innerText()).includes("[Komari GFW:"));
+  await page.screenshot({ path: join(root, "admin-ping-tasks.png"), fullPage: true });
+  await page.locator(".km-pingtask-nav").getByRole("tab").nth(1).click();
+  const serverView = page.locator(".km-pingtask-server-list");
+  await serverView.getByText("Test overseas", { exact: true }).waitFor();
+  assert.ok(!(await serverView.innerText()).includes("[Komari GFW:"));
+  await page.screenshot({ path: join(root, "admin-ping-servers.png"), fullPage: true });
+  for (const assigned of [false, true]) {
+    await serverView.getByRole("row").filter({ hasText: "Test overseas" }).getByRole("button").click();
+    const dialog = page.locator(".km-pingtask-server-form");
+    await dialog.locator("tbody tr").filter({ hasText: userBeforeEdit.name }).waitFor();
+    assert.equal(await dialog.locator("tbody tr").count(), 1);
+    assert.ok(!(await dialog.innerText()).includes("[Komari GFW:"));
+    if (!assigned) await page.screenshot({ path: join(root, "admin-ping-selector.png"), fullPage: true });
+    await dialog.locator("tbody tr").click();
+    await dialog.getByRole("button", { name: /^(保存|Save)$/ }).click();
+    await dialog.waitFor({ state: "hidden" });
+    await waitFor(async () => (await rawTasks()).find(t => t.id === userTask.task_id).clients.includes(monitored.uuid) === assigned, "Native user task membership saved");
+    assert.deepEqual((await rawTasks()).filter(t => t.name.startsWith("[Komari GFW:")), ownBeforeEdit);
+  }
+  assert.deepEqual((await rawTasks()).find(t => t.id === userTask.task_id), userBeforeEdit);
+  const added = (await json("/api/admin/ping/add", { name: "Ordinary CRUD fixture", target: `127.0.0.1:${ports[4].port}`, type: "tcp", interval: 60, clients: [monitored.uuid], default_on: false })).data;
+  const temporary = (await rpc("admin:getAllPingTasks")).find(t => t.id === added.task_id);
+  assert.ok(temporary);
+  await json("/api/admin/ping/edit", { tasks: [{ ...temporary, name: "Edited ordinary fixture" }] });
+  await json("/api/admin/ping/order", { [temporary.id]: 10 });
+  assert.equal((await rpc("admin:getAllPingTasks")).find(t => t.id === temporary.id).name, "Edited ordinary fixture");
+  assert.equal((await rpc("admin:getAllPingTasks")).find(t => t.id === temporary.id).weight, 10);
+  await json("/api/admin/ping/delete", { id: [temporary.id] });
+  assert.deepEqual(await rawTasks(), rawBeforeEdit);
+  await verifyVisibility();
+  console.log("PASS: native admin task/server views and task selector hide internals; user binding edits and CRUD preserve all plugin tasks");
   await page.goto(base + overviewPath);
   const overviewFrame = page.frameLocator("iframe.km-plugin-frame");
   await overviewFrame.getByRole("heading", { name: "被墙检测总览", exact: true }).waitFor();
@@ -459,7 +556,7 @@ try {
   settings = await plugin("settings");
   await plugin("settings", { config: { ...settings.config, enabled: true }, revision: settings.revision });
   await cycle();
-  const existingUserTask = (await rpc("admin:getAllPingTasks")).find(t => t.id === userTask.task_id);
+  const existingUserTask = (await rawTasks()).find(t => t.id === userTask.task_id);
   const messageCount = pluginMessages().length;
   await rpc("admin:removeClient", { uuid: agents[1].uuid });
   overview = await plugin("refresh", {});
@@ -467,8 +564,8 @@ try {
   assert.equal(overview.enabled, true);
   assert.equal(overview.strict, false);
   assert.match(overview.selectionNotice, /严格模式已自动关闭，继续普通模式监测/);
-  assert.ok(!(await rpc("admin:getAllPingTasks")).some(t => t.name.includes(":reverse:")));
-  assert.deepEqual((await rpc("admin:getAllPingTasks")).find(t => t.id === userTask.task_id), existingUserTask);
+  assert.ok(!(await rawTasks()).some(t => t.name.includes(":reverse:")));
+  assert.deepEqual((await rawTasks()).find(t => t.id === userTask.task_id), existingUserTask);
   overview = await cycle();
   assert.equal(overview.rows[0].health, "healthy");
   assert.equal(pluginMessages().length, messageCount);
@@ -505,9 +602,10 @@ try {
   assert.deepEqual(errors, []);
   console.log("PASS: deleted observer disables strict mode only; notice acknowledges and expires without saving, reload does not repeat it; basic probes continue; last target deletion stops without false recovery");
   await plugin("cleanup", { confirm: "DELETE_PLUGIN_TASKS" });
-  assert.deepEqual((await rpc("admin:getAllPingTasks") ?? []).map(t => t.id), [userTask.task_id]);
+  assert.deepEqual((await rawTasks()).map(t => t.id), [userTask.task_id]);
+  assert.deepEqual((await rpc("admin:getAllPingTasks")).map(t => t.id), [userTask.task_id]);
   console.log("PASS: owned-task cleanup");
-  await writeFile(join(root, "host-test-result.json"), JSON.stringify({ komari: hostVersion, plugin: manifest.version, upgradeFrom: Boolean(process.env.KOMARI_TEST_UPGRADE_FROM), passed: true, checkedAt: new Date().toISOString(), checks: ["ZIP lifecycle", "ACL/CSRF", "raw metrics", "strict 2-observer block/recovery", "Webhook title/direction/redaction", "persistence", "owned rollup retention", "public HTTP/WS filtering", "user history/statistics", "paused filtering", "observer search", "desktop/mobile UI", "deleted observer switches to basic monitoring", "deleted selection save/reload", "deleted last target stops without false recovery", "cleanup"], limitation: "Synthetic v2 Agents with real loopback TCP, not production geographically distributed Agents; real retention test uses SQLite. Hook limits are not an authorization boundary." }, null, 2));
+  await writeFile(join(root, "host-test-result.json"), JSON.stringify({ komari: hostVersion, plugin: manifest.version, upgradeFrom: Boolean(process.env.KOMARI_TEST_UPGRADE_FROM), passed: true, checkedAt: new Date().toISOString(), checks: ["ZIP lifecycle", "ACL/CSRF", "raw metrics", "strict 2-observer block/recovery", "reverse/forward/both changes", "Webhook title/direction/redaction/no explanation", "persistence", "owned rollup retention", "public/admin HTTP/WS filtering", "native task/server/selector UI and user CRUD", "user history/statistics", "paused filtering", "observer search", "desktop/mobile UI", "deleted observer switches to basic monitoring", "deleted selection save/reload", "deleted last target stops without false recovery", "cleanup"], limitation: "Synthetic v2 Agents with real loopback TCP, not production geographically distributed Agents; real retention test uses SQLite. Hook limits are not an authorization boundary." }, null, 2));
 } catch (error) {
   await writeFile(join(root, "host-test-error.log"), log);
   console.error(error?.stack ?? String(error)); process.exitCode = 1;
