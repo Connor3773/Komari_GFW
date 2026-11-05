@@ -25,10 +25,17 @@ export class TaskVisibility {
     for (const task of tasks) {
       if (!object(task) || !id(task.id) || typeof task.name !== "string") continue;
       if (this.owns(task.name)) this.ids.add(id(task.id));
-      else this.ids.delete(id(task.id)); // A live, renamed/reused ID is no longer ours.
+      else {
+        this.ids.delete(id(task.id)); // A live, renamed/reused ID is no longer ours.
+        if (this.state.retiredTasks) delete this.state.retiredTasks[id(task.id)];
+      }
     }
     // Keep only ownership evidence, not latency history. Retired IDs cover cached/raw
     // results after deletion and survive upgrades. Live user-owned IDs revoke it.
+    this.state.hiddenTaskIds = [...this.ids].map(Number);
+  }
+  forget(verifiedIds: number[]): void {
+    for (const value of verifiedIds) this.ids.delete(id(value));
     this.state.hiddenTaskIds = [...this.ids].map(Number);
   }
   warn(): void { this.lastError = failure; }

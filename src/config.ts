@@ -84,7 +84,8 @@ export function validateConfig(raw: unknown, available?: ReadonlySet<string>): C
   if (new Set(targets.map(t => t.address)).size !== 5) throw new Error("5 个探测目标不能重复");
   let clients = ids(v.clients, 200);
   let observers = ids(v.observers, 20);
-  let strict = bool(v.strict, "严格模式");
+  const legacyStrict = bool(v.strict, "正向检测全局开关");
+  let strict = legacyStrict;
   let enabled = bool(v.enabled, "监测总开关");
   if (available) {
     const remaining = clients.filter(id => available.has(id));
@@ -98,16 +99,16 @@ export function validateConfig(raw: unknown, available?: ReadonlySet<string>): C
   const reverse: Record<string, ReverseTarget> = {};
   const inputs = object(v.reverse);
   for (const uuid of clients) {
-    if (inputs[uuid] !== undefined) {
-      const item = object(inputs[uuid]);
-      const host = typeof item.host === "string" ? item.host.trim() : "";
-      reverse[uuid] = { port: integer(item.port, 1, 65535, "测试端口"), host: host ? normalizeHost(host) : "" };
-    }
-    if (strict && !reverse[uuid]) throw new Error("严格模式需要为每台受检服务器填写测试端口");
-    if (strict && !observers.some(id => id !== uuid)) throw new Error("每台受检服务器至少需要一个不同于自身的境内探针");
+    const item = inputs[uuid] === undefined ? {} : object(inputs[uuid]);
+    const forward = item.enabled === undefined ? legacyStrict : bool(item.enabled, "服务器正向检测");
+    const active = strict && forward;
+    const host = typeof item.host === "string" ? item.host.trim() : "";
+    if (host.length > 300) throw new Error("测试地址过长");
+    const port = item.port == null ? 0 : integer(item.port, -Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER, "测试端口");
+    reverse[uuid] = { enabled: forward, port: active ? integer(port, 1, 65535, "测试端口") : port, host: active && host ? normalizeHost(host) : host };
+    if (active && !observers.some(id => id !== uuid)) throw new Error("开启正向检测的服务器至少需要一个不同于自身的境内探针");
   }
   if (enabled && clients.length === 0) throw new Error("开启监测前请先选择服务器");
-  if (strict && observers.length === 0) throw new Error("严格模式至少需要一个境内探针");
   return {
     enabled, strict, clients, observers, reverse, targets,
     intervalSeconds: integer(v.intervalSeconds, 30, 300, "检测间隔"),
@@ -122,15 +123,22 @@ export function reverseAddress(config: Config, client: Client): string {
   const target = config.reverse[client.uuid];
   if (!target) throw new Error("缺少测试端口");
   const host = target.host || client.ipv4 || client.ipv6;
-  if (!host) throw new Error("严格模式需要服务器 IP 或手动填写测试地址");
+  if (!host) throw new Error("正向检测需要服务器 IP 或手动填写测试地址");
   return normalizeAddress(`${normalizeHost(host)}:${target.port}`);
 }
 
 export function monitorKeys(config: Config, uuid: string): string[] {
-  return [...SLOTS, ...(config.strict ? config.observers.filter(id => id !== uuid).map(id => `reverse:${id}`) : [])];
+  return [...SLOTS, ...(forwardEnabled(config, uuid) ? config.observers.filter(id => id !== uuid).map(id => `reverse:${id}`) : [])];
 }
 
-export function detectionSignature(config: Config): string {
-  const { maskIp: _mask, targets, ...rest } = config;
-  return JSON.stringify({ ...rest, targets: targets.map(t => ({ id: t.id, address: t.address })) });
+export function forwardEnabled(config: Config, uuid: string): boolean {
+  // Missing per-server switches in legacy strict configurations mean enabled.
+  return config.strict && config.clients.includes(uuid) && config.reverse[uuid]?.enabled !== false;
+}
+
+export function detectionSignature(config: Config, uuid: string): string {
+  return JSON.stringify({ enabled: config.enabled, interval: config.intervalSeconds, failure: config.failureThreshold,
+    recovery: config.recoveryThreshold, overseas: config.overseasRequired,
+    targets: config.targets.map(t => ({ id: t.id, address: t.address })),
+    forward: forwardEnabled(config, uuid) ? { target: config.reverse[uuid], observers: config.observers.filter(id => id !== uuid) } : null });
 }

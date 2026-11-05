@@ -145,7 +145,7 @@ for (const type of ["blocked", "recovered"] as const) test(`notification title a
   assert.ok(result.message.includes(`被墙状态：${recovered ? "已解除" : "疑似双向墙"}`));
   assert.ok(result.message.includes(`反向（受检服务器到大陆目标）：${recovered ? 3 : 0}/3 可达`));
   assert.ok(result.message.includes("非大陆对照（受检服务器到非大陆目标）：2/2 可达"));
-  assert.ok(result.message.includes(`正向（大陆探针到受检服务器）：${recovered ? 2 : 0}/2 可达（严格模式）`));
+  assert.ok(result.message.includes(`正向（大陆探针到受检服务器）：${recovered ? 2 : 0}/2 可达（正向检测）`));
   assert.doesNotMatch(result.event + result.message, /GFW/);
 });
 

@@ -8,6 +8,7 @@ import http from "node:http";
 import { once } from "node:events";
 import { chromium } from "@playwright/test";
 import { unzipSync, strFromU8 } from "fflate";
+import { collectRetiredHistory, RETIRED_PROTECTION_MS } from "../src/retention.ts";
 
 // This harness creates a fresh loopback-only host and synthetic Agent identities.
 // No production URL or credential is accepted, and every TCP target is loopback.
@@ -30,7 +31,7 @@ function verifyNotificationCopy() {
   for (const [message, count] of [[blocked, 0], [recovered, 3]]) {
     assert.ok(message.message.includes(`反向（受检服务器到大陆目标）：${count}/3 可达`));
     assert.ok(message.message.includes("非大陆对照（受检服务器到非大陆目标）：2/2 可达"));
-    assert.ok(message.message.includes(`正向（大陆探针到受检服务器）：${count ? 2 : 0}/2 可达（严格模式）`));
+    assert.ok(message.message.includes(`正向（大陆探针到受检服务器）：${count ? 2 : 0}/2 可达（正向检测）`));
     assert.ok(message.message.includes("203.0.*.*"));
     assert.ok(!message.message.includes("203.0.113.25"));
   }
@@ -159,7 +160,7 @@ try {
     }
     return waitFor(async () => {
       const state = await plugin("refresh", {});
-      return state.rows[0].lastRoundAt >= started ? state : null;
+      return state.rows.length && state.rows.every(row => row.lastRoundAt >= started) ? state : null;
     }, "Fresh complete TCP round", 15000);
   }
   let overview = await cycle();
@@ -201,6 +202,7 @@ try {
     const expected = structuredClone(before.config);
     expected.clients = expected.clients.filter(id => id !== removed.uuid);
     delete expected.reverse[removed.uuid];
+    for (const uuid of expected.clients) expected.reverse[uuid].enabled ??= expected.strict;
     const repaired = await plugin("settings");
     assert.deepEqual(repaired.config, expected);
     assert.equal(repaired.lastError, "");
@@ -472,6 +474,51 @@ try {
   assert.deepEqual(await rawTasks(), rawBeforeEdit);
   await verifyVisibility();
   console.log("PASS: native admin task/server views and task selector hide internals; user binding edits and CRUD preserve all plugin tasks");
+  const mixedAgent = await rpc("admin:addClient", { name: "Test reverse-only" });
+  agents.push(mixedAgent);
+  settings = await plugin("settings");
+  settings = await plugin("settings", { config: { ...settings.config, clients: [...settings.config.clients, mixedAgent.uuid], reverse: { ...settings.config.reverse, [mixedAgent.uuid]: { enabled: false, port: 0, host: "" } } }, revision: settings.revision });
+  assert.equal(settings.lastError, "");
+  overview = await cycle();
+  assert.equal(overview.rows.find(r => r.uuid === mixedAgent.uuid).samples.length, 5);
+  assert.ok(overview.rows.every(r => r.health === "healthy"));
+  assert.equal((await rawTasks()).filter(t => t.name.includes(":reverse:")).length, 1);
+  const mixedStart = pluginMessages().length;
+  for (const i of [0, 1, 2]) await new Promise(r => ports[i].listener.close(r));
+  overview = await cycle();
+  assert.equal(overview.rows.find(r => r.uuid === mixedAgent.uuid).alarmDirection, "basic");
+  assert.equal(overview.rows.find(r => r.uuid === monitored.uuid).alarmDirection, "reverse");
+  await page.goto(base + overviewPath);
+  const mixedMatrix = page.frameLocator("iframe.km-plugin-frame").locator("#matrix");
+  await mixedMatrix.getByText("疑似被墙", { exact: true }).waitFor();
+  await mixedMatrix.getByText("疑似反向墙", { exact: true }).waitFor();
+  await mixedMatrix.getByText("未启用", { exact: true }).waitFor();
+  for (const i of [0, 1, 2]) ports[i].listener = await tcpServer(ports[i].port);
+  overview = await cycle();
+  assert.ok(overview.rows.every(r => !r.alarm));
+  const mixedNotices = pluginMessages().slice(mixedStart).map(body => JSON.parse(body));
+  assert.equal(mixedNotices.length, 4);
+  assert.equal(mixedNotices.filter(n => n.message.includes("服务器：Test reverse-only") && !n.message.includes("正向（大陆探针")).length, 2);
+  settings = await plugin("settings");
+  const existingForward = (await rawTasks()).find(t => t.name.endsWith(`:reverse:${monitored.uuid}]`));
+  settings = await plugin("settings", { config: { ...settings.config, reverse: { ...settings.config.reverse, [mixedAgent.uuid]: { enabled: true, port: ports[5].port, host: "127.0.0.1" } } }, revision: settings.revision });
+  assert.equal(settings.lastError, "");
+  const removedForward = (await rawTasks()).find(t => t.name.endsWith(`:reverse:${mixedAgent.uuid}]`));
+  assert.ok(removedForward);
+  overview = await cycle();
+  assert.ok(overview.rows.every(r => r.forwardEnabled && r.health === "healthy"));
+  await rpc("admin:removeClient", { uuid: mixedAgent.uuid });
+  overview = await plugin("refresh", {});
+  assert.equal(overview.rows.length, 1);
+  assert.equal(overview.strict, true);
+  assert.equal(overview.enabled, true);
+  assert.ok(!(await rawTasks()).some(t => t.id === removedForward.id));
+  assert.deepEqual((await rawTasks()).find(t => t.id === existingForward.id), existingForward);
+  settings = await plugin("settings");
+  assert.ok(!(mixedAgent.uuid in settings.config.reverse));
+  await plugin("settings", { config: settings.config, revision: settings.revision });
+  await cycle();
+  console.log("PASS: mixed forward/reverse-only tasks, independent alarms/recovery, overview and dedicated task deletion");
   await page.goto(base + overviewPath);
   const overviewFrame = page.frameLocator("iframe.km-plugin-frame");
   await overviewFrame.getByRole("heading", { name: "被墙检测总览", exact: true }).waitFor();
@@ -510,6 +557,66 @@ try {
   await observerSearch.fill("Synthetic fixtures");
   assert.equal(await configFrame.locator("#observers input:checked").count(), 2);
   await observerSearch.fill("");
+  const extraClients = [];
+  for (let i = 0; i < 32; i++) extraClients.push(await rpc("admin:addClient", { name: `Compact selection ${String(i).padStart(2, "0")}` }));
+  await configPage.reload();
+  await waitFor(async () => !(await configFrame.locator("#settings-fields").isDisabled()), "Large selection loaded");
+  async function verifyCompactSelection() {
+    for (const id of ["clients", "observers"]) {
+      const region = configFrame.locator(`#${id}`);
+      const dimensions = await region.evaluate(el => ({ height: el.clientHeight, scroll: el.scrollHeight, width: el.clientWidth, scrollWidth: el.scrollWidth, max: parseFloat(getComputedStyle(el).maxHeight), overflow: getComputedStyle(el).overflowY }));
+      assert.ok(dimensions.height <= 360 && dimensions.height <= dimensions.max + 1, `${id} bounded height`);
+      assert.ok(dimensions.scroll > dimensions.height, `${id} internal scroll`);
+      assert.equal(dimensions.overflow, "auto");
+      assert.ok(dimensions.scrollWidth <= dimensions.width, `${id} no horizontal overflow`);
+      await region.evaluate(el => { el.scrollTop = el.scrollHeight; });
+      assert.ok(await region.evaluate(el => el.scrollTop > 0));
+      await region.evaluate(el => { el.scrollTop = 0; });
+    }
+  }
+  await verifyCompactSelection();
+  const forwardToggle = configFrame.getByRole("checkbox", { name: "Test overseas 启用正向检测", exact: true });
+  const portInput = configFrame.getByRole("spinbutton", { name: "Test overseas 测试端口", exact: true });
+  const hostInput = configFrame.getByRole("textbox", { name: "Test overseas 测试地址", exact: true });
+  await portInput.fill(""); await hostInput.fill("unfinished/");
+  assert.equal(await portInput.evaluate(el => el.validity.valid), false);
+  await forwardToggle.uncheck();
+  assert.equal(await portInput.count(), 0);
+  await configFrame.getByRole("button", { name: "保存配置", exact: true }).click();
+  await configFrame.getByText("配置已保存，探测任务已同步。", { exact: true }).waitFor();
+  settings = await plugin("settings");
+  assert.equal(settings.config.reverse[monitored.uuid].port, 0);
+  assert.equal(settings.config.reverse[monitored.uuid].host, "unfinished/");
+  assert.equal(settings.config.reverse[monitored.uuid].enabled, false);
+  await configPage.reload();
+  await waitFor(async () => !(await configFrame.locator("#settings-fields").isDisabled()), "Disabled draft reloaded");
+  await forwardToggle.check();
+  assert.equal(await portInput.inputValue(), "");
+  assert.equal(await hostInput.inputValue(), "unfinished/");
+  await portInput.fill(String(ports[5].port)); await hostInput.fill("127.0.0.1");
+  await configFrame.locator("#strict").uncheck();
+  assert.equal(await forwardToggle.count(), 0);
+  assert.equal(await configFrame.locator("[data-forward-client]").count(), 0);
+  assert.equal(await portInput.count(), 0);
+  assert.equal(await configFrame.locator("#strict-options").isHidden(), true);
+  await configFrame.getByRole("button", { name: "保存配置", exact: true }).click();
+  await configFrame.getByText("配置已保存，探测任务已同步。", { exact: true }).waitFor();
+  await configPage.reload();
+  await waitFor(async () => !(await configFrame.locator("#settings-fields").isDisabled()), "Global-off draft reloaded");
+  assert.equal(await forwardToggle.count(), 0);
+  assert.equal(await configFrame.locator("[data-forward-client]").count(), 0);
+  assert.equal(await portInput.count(), 0);
+  await configFrame.locator("#strict").check();
+  assert.equal(await forwardToggle.isChecked(), true);
+  assert.equal(await portInput.inputValue(), String(ports[5].port));
+  assert.equal(await hostInput.inputValue(), "127.0.0.1");
+  const clientSearch = configFrame.locator("#client-search");
+  await clientSearch.fill("no matching server");
+  assert.equal(await configFrame.locator("#clients input").count(), 0);
+  await clientSearch.fill("Test overseas");
+  assert.equal(await forwardToggle.isChecked(), true);
+  assert.equal(await portInput.inputValue(), String(ports[5].port));
+  await clientSearch.fill("");
   await configPage.screenshot({ path: join(root, "probes-desktop.png"), fullPage: true });
   await configFrame.locator("#enabled").uncheck();
   await configFrame.getByRole("button", { name: "保存配置", exact: true }).click();
@@ -532,6 +639,16 @@ try {
     await waitFor(menuCollapsed, "Mobile menu closed");
   }
   await closeMobileMenu();
+  await verifyCompactSelection();
+  await configFrame.locator("#strict").uncheck();
+  assert.equal(await configFrame.locator("[data-forward-client], .reverse-fields").count(), 0);
+  await configFrame.locator("#strict").check();
+  assert.equal(await forwardToggle.isChecked(), true);
+  assert.equal(await portInput.inputValue(), String(ports[5].port));
+  assert.equal(await hostInput.inputValue(), "127.0.0.1");
+  // Restore the saved form without leaving a spurious beforeunload prompt.
+  await configFrame.getByRole("button", { name: "保存配置", exact: true }).click();
+  await configFrame.getByText("配置已保存，探测任务已同步。", { exact: true }).waitFor();
   assert.equal(await configPage.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
   assert.equal(await configFrame.locator("html").evaluate(el => el.scrollWidth <= el.clientWidth), true);
   await configPage.screenshot({ path: join(root, "settings-mobile.png"), fullPage: true });
@@ -553,6 +670,7 @@ try {
   assert.deepEqual(errors, []);
   console.log("PASS: native admin navigation, display names, no duplicate header links, config save/reload and desktop/mobile UI");
   await configPage.goto(base + "/api/version");
+  for (const client of extraClients) await rpc("admin:removeClient", { uuid: client.uuid });
   settings = await plugin("settings");
   await plugin("settings", { config: { ...settings.config, enabled: true }, revision: settings.revision });
   await cycle();
@@ -563,7 +681,7 @@ try {
   assert.equal(overview.lastError, "");
   assert.equal(overview.enabled, true);
   assert.equal(overview.strict, false);
-  assert.match(overview.selectionNotice, /严格模式已自动关闭，继续普通模式监测/);
+  assert.match(overview.selectionNotice, /正向检测已自动关闭，继续反向检测/);
   assert.ok(!(await rawTasks()).some(t => t.name.includes(":reverse:")));
   assert.deepEqual((await rawTasks()).find(t => t.id === userTask.task_id), existingUserTask);
   overview = await cycle();
@@ -574,7 +692,7 @@ try {
   await waitFor(async () => !(await configFrame.locator("#settings-fields").isDisabled()), "Repaired settings enabled");
   assert.equal(await configFrame.locator("#enabled").isChecked(), true);
   assert.equal(await configFrame.locator("#strict").isChecked(), false);
-  assert.match(await configFrame.locator("#selection-notice").innerText(), /严格模式已自动关闭/);
+  assert.match(await configFrame.locator("#selection-notice").innerText(), /正向检测已自动关闭/);
   await configPage.screenshot({ path: join(root, "deleted-observer-settings.png"), fullPage: true });
   const repairedRevision = (await plugin("settings")).revision;
   await waitFor(async () => !(await plugin("settings")).selectionNotice, "Selection notice acknowledged without saving");
@@ -591,11 +709,13 @@ try {
   assert.equal(settings.config.strict, false);
   assert.equal(settings.config.enabled, true);
   await cycle();
+  const retiring = (await rawTasks()).filter(t => t.name.startsWith("[Komari GFW:"));
   await rpc("admin:removeClient", { uuid: monitored.uuid });
   overview = await plugin("refresh", {});
   assert.equal(overview.lastError, "");
   assert.equal(overview.enabled, false);
   assert.deepEqual(overview.rows, []);
+  assert.deepEqual((await rawTasks()).map(t => t.id), [userTask.task_id]);
   assert.equal(pluginMessages().length, messageCount);
   settings = await plugin("settings");
   await plugin("settings", { config: settings.config, revision: settings.revision });
@@ -605,6 +725,17 @@ try {
   assert.deepEqual((await rawTasks()).map(t => t.id), [userTask.task_id]);
   assert.deepEqual((await rpc("admin:getAllPingTasks")).map(t => t.id), [userTask.task_id]);
   console.log("PASS: owned-task cleanup");
+  // Exercise the real metrics SQL with aged test-only tombstones. Hooks are off
+  // so public RPC here reads raw host samples, just like in-process server.call.
+  await rpc("admin:setPluginEnabled", { short: manifest.short, enabled: false });
+  const gcNow = Date.now();
+  const retired = Object.fromEntries(retiring.map(t => [t.id, { name: t.name, deletedAt: gcNow - RETIRED_PROTECTION_MS }]));
+  const userRows = await sqlQuery("SELECT * FROM metric_series WHERE tags_hash = ?", [createHash("sha256").update(JSON.stringify({ task_id: String(userTask.task_id) })).digest("hex")]);
+  const collected = await collectRetiredHistory({ call: rpc }, retired, "metric_", gcNow, agents.map(a => a.uuid));
+  assert.deepEqual(collected.sort((a, b) => a - b), retiring.map(t => t.id).sort((a, b) => a - b));
+  for (const task of retiring) assert.deepEqual(await sqlQuery("SELECT id FROM metric_series WHERE tags_hash = ?", [createHash("sha256").update(JSON.stringify({ task_id: String(task.id) })).digest("hex")]), []);
+  assert.deepEqual(await sqlQuery("SELECT * FROM metric_series WHERE tags_hash = ?", [createHash("sha256").update(JSON.stringify({ task_id: String(userTask.task_id) })).digest("hex")]), userRows);
+  console.log("PASS: real SQLite retired dictionary GC, unfiltered raw verification and user data preservation (accelerated test tombstones)");
   await writeFile(join(root, "host-test-result.json"), JSON.stringify({ komari: hostVersion, plugin: manifest.version, upgradeFrom: Boolean(process.env.KOMARI_TEST_UPGRADE_FROM), passed: true, checkedAt: new Date().toISOString(), checks: ["ZIP lifecycle", "ACL/CSRF", "raw metrics", "strict 2-observer block/recovery", "reverse/forward/both changes", "Webhook title/direction/redaction/no explanation", "persistence", "owned rollup retention", "public/admin HTTP/WS filtering", "native task/server/selector UI and user CRUD", "user history/statistics", "paused filtering", "observer search", "desktop/mobile UI", "deleted observer switches to basic monitoring", "deleted selection save/reload", "deleted last target stops without false recovery", "cleanup"], limitation: "Synthetic v2 Agents with real loopback TCP, not production geographically distributed Agents; real retention test uses SQLite. Hook limits are not an authorization boundary." }, null, 2));
 } catch (error) {
   await writeFile(join(root, "host-test-error.log"), log);

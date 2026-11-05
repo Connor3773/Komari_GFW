@@ -1,9 +1,9 @@
-import { cleanText, defaultConfig, detectionSignature, monitorKeys, reverseAddress, validateConfig } from "./config.ts";
+import { cleanText, defaultConfig, detectionSignature, forwardEnabled, monitorKeys, reverseAddress, validateConfig } from "./config.ts";
 import { evaluate, newMonitor, resetStreaks, staleAfter } from "./engine.ts";
 import { notificationEvent, safeClient } from "./privacy.ts";
 import type { Client, Config, MetricSeries, Monitor, Notice, NotificationStatus, PingTask, Rpc, Sample, State } from "./types.ts";
 import { UserError } from "./errors.ts";
-import { EVENT_HISTORY_LIMIT, EVENT_HISTORY_MS, prunePingHistory } from "./retention.ts";
+import { collectRetiredHistory, EVENT_HISTORY_LIMIT, EVENT_HISTORY_MS, prunePingHistory, readPingTasks } from "./retention.ts";
 import { PREFIX, TaskVisibility } from "./visibility.ts";
 
 export interface Store { save(state: State): void }
@@ -28,7 +28,7 @@ function selectionNotice(previous: Config, current: Config): string {
   const observers = new Set(previous.observers.filter(id => !current.observers.includes(id))).size;
   if (!clients && !observers) return "";
   const removed = [clients ? `${clients} 台已删除的受检服务器` : "", observers ? `${observers} 台已删除的境内探针` : ""].filter(Boolean).join("和");
-  const mode = previous.strict && !current.strict ? `严格模式已自动关闭，${current.enabled ? "继续普通模式监测" : "监测保持关闭"}。` : "";
+  const mode = previous.strict && !current.strict ? `正向检测已自动关闭，${current.enabled ? "继续反向检测" : "监测保持关闭"}。` : "";
   const paused = previous.enabled && !current.enabled ? "受检服务器已全部删除，监测已自动关闭。" : "";
   return `已移除 ${removed}及其配置。${mode}${paused}`;
 }
@@ -46,15 +46,18 @@ export class Service {
   private clock: () => number;
   private retentionAttempt = 0;
   private metricPrefix = "metric_";
+  private taskCleanupError = "";
 
   constructor(state: State, rpc: Rpc, store: Store, clock = Date.now) {
     this.state = state;
     this.rpc = rpc;
     this.store = store;
     this.clock = clock;
+    state.config = validateConfig(state.config);
+    state.retiredTasks ??= {};
     for (const [uuid, monitor] of Object.entries(state.monitors)) {
       const lastAlarm = state.events.filter(event => event.client === uuid && event.type === "blocked").at(-1);
-      const legacyDirection = state.config.strict && (!lastAlarm || lastAlarm.reverseTotal > 0) ? "both" : "basic";
+      const legacyDirection = forwardEnabled(state.config, uuid) && (!lastAlarm || lastAlarm.reverseTotal > 0) ? "both" : "basic";
       monitor.alarmDirection = monitor.alarm ? monitor.alarmDirection ?? legacyDirection : null;
     }
     this.visibility = new TaskVisibility(state);
@@ -90,24 +93,50 @@ export class Service {
   }
 
   private taskName(key: string): string { return `${PREFIX}${this.state.instance}:${key}]`; }
-  private owns(task: PingTask): boolean { return task.name.startsWith(`${PREFIX}${this.state.instance}:`) && task.name.endsWith("]"); }
+  private owns(task: PingTask): boolean { return this.visibility.owns(task.name); }
+
+  private async deleteOwned(candidates: PingTask[]): Promise<void> {
+    if (!candidates.length) return;
+    const live = await readPingTasks(this.rpc);
+    this.visibility.observe(live);
+    const selected = live.filter(task => this.owns(task) && candidates.some(c => c.id === task.id && c.name === task.name));
+    for (let offset = 0; offset < selected.length; offset += 50) {
+      const batch = selected.slice(offset, offset + 50);
+      for (const task of batch) this.state.retiredTasks![task.id] = { name: task.name, deletedAt: null };
+      this.persist(); // A failed/partially completed host delete must remain retryable.
+      await this.rpc.call("admin:deletePingTask", { id: batch.map(task => task.id) });
+      for (const task of batch) this.state.retiredTasks![task.id].deletedAt = this.clock();
+      this.persist();
+    }
+  }
 
   async reconcile(forcePause = false): Promise<void> {
     const cfg = this.state.config;
     const active = cfg.enabled && !forcePause;
-    const all = await this.rpc.call<PingTask[] | null>("admin:getAllPingTasks") ?? [];
+    const all = await readPingTasks(this.rpc);
     this.visibility.observe(all);
     const owned = all.filter(t => this.owns(t));
+    for (const [key, id] of Object.entries(this.state.tasks)) {
+      if (this.visibility.has(id) && this.visibility.owns(this.taskName(key)) && !all.some(t => t.id === id)) {
+        this.state.retiredTasks![id] ??= { name: this.taskName(key), deletedAt: this.clock() };
+      }
+    }
+    this.state.tasks = Object.fromEntries(Object.entries(this.state.tasks).filter(([key, id]) => owned.some(t => t.id === id && t.name === this.taskName(key))));
+    for (const [id, retired] of Object.entries(this.state.retiredTasks!)) {
+      const live = all.find(t => t.id === Number(id));
+      if (live && live.name !== retired.name) delete this.state.retiredTasks![id];
+      else if (!live && retired.deletedAt === null) retired.deletedAt = this.clock();
+    }
     const desired = new Map<string, Omit<PingTask, "id">>();
     if (active) {
-      for (const uuid of [...cfg.clients, ...(cfg.strict ? cfg.observers : [])]) {
+      for (const uuid of [...cfg.clients, ...(cfg.clients.some(id => forwardEnabled(cfg, id)) ? cfg.observers : [])]) {
         if (!this.clients.some(c => c.uuid === uuid)) throw new Error("配置中有服务器已被删除，请重新选择服务器");
       }
       for (const target of cfg.targets) desired.set(`forward:${target.id}`, {
         name: this.taskName(`forward:${target.id}`), target: target.address, type: "tcp",
         interval: cfg.intervalSeconds, clients: cfg.clients, default_on: false,
       });
-      if (cfg.strict) for (const uuid of cfg.clients) {
+      for (const uuid of cfg.clients.filter(id => forwardEnabled(cfg, id))) {
         const client = this.clients.find(c => c.uuid === uuid)!;
         desired.set(`reverse:${uuid}`, {
           name: this.taskName(`reverse:${uuid}`), target: reverseAddress(cfg, client), type: "tcp",
@@ -115,12 +144,15 @@ export class Service {
         });
       }
     }
-    let sourcesChanged = false;
+    const changedClients = new Set<string>();
     const nextSources: Record<string, string> = {};
     const used = new Set<number>();
     for (const [key, want] of desired) {
+      const sourceChanged = () => {
+        for (const uuid of key.startsWith("reverse:") ? [key.slice(8)] : want.clients) changedClients.add(uuid);
+      };
       nextSources[key] = JSON.stringify({ target: want.target, clients: [...want.clients].sort(), interval: want.interval });
-      if (nextSources[key] !== this.state.sources[key]) sourcesChanged = true;
+      if (nextSources[key] !== this.state.sources[key]) sourceChanged();
       const matches = owned.filter(t => t.name === want.name).sort((a, b) => a.id - b.id);
       let task = matches.find(t => t.id === this.state.tasks[key]) ?? matches[0];
       if (!task) {
@@ -128,27 +160,30 @@ export class Service {
         if (!Number.isInteger(result.task_id) || result.task_id <= 0) throw new Error("创建探测任务返回无效 ID");
         task = { ...want, id: result.task_id };
         this.visibility.observe([task]);
-        sourcesChanged = true;
+        sourceChanged();
       } else if (task.target !== want.target || task.type !== "tcp" || task.interval !== want.interval || task.default_on || JSON.stringify([...(task.clients ?? [])].sort()) !== JSON.stringify([...want.clients].sort())) {
         await this.rpc.call("admin:editPingTask", { tasks: [{ ...task, ...want }] });
-        sourcesChanged = true;
+        sourceChanged();
       }
-      if (this.state.tasks[key] !== task.id) sourcesChanged = true;
+      if (this.state.tasks[key] !== task.id) sourceChanged();
       const mappingChanged = this.state.tasks[key] !== task.id;
       this.state.tasks[key] = task.id;
       used.add(task.id);
+      delete this.state.retiredTasks![task.id];
       // Persist each creation so an interrupted reconciliation can safely resume.
       if (mappingChanged) this.persist();
     }
     const pause = owned.filter(t => !used.has(t.id) && ((t.clients ?? []).length || t.default_on));
     if (pause.length) await this.rpc.call("admin:editPingTask", { tasks: pause.map(t => ({ ...t, clients: [], default_on: false })) });
-    const retiredReverse = (key: string) => key.startsWith("reverse:") && (!cfg.strict || !cfg.clients.includes(key.slice(8)));
-    const obsolete = owned.filter(t => !used.has(t.id) && (active || retiredReverse(t.name.slice(`${PREFIX}${this.state.instance}:`.length, -1))));
-    if (obsolete.length) await this.rpc.call("admin:deletePingTask", { id: obsolete.map(t => t.id) });
-    this.state.tasks = Object.fromEntries(Object.entries(this.state.tasks).filter(([key]) => active ? desired.has(key) : !retiredReverse(key)));
-    if (sourcesChanged) {
-      this.resetMonitors();
-      for (const event of this.state.events) if (event.delivery === "pending") {
+    const retiredKey = (key: string) => !cfg.clients.length || (key.startsWith("reverse:") && !forwardEnabled(cfg, key.slice(8)));
+    const obsolete = owned.filter(t => !used.has(t.id) && (active || retiredKey(t.name.slice(`${PREFIX}${this.state.instance}:`.length, -1)) || this.state.retiredTasks![t.id]?.deletedAt === null));
+    try { await this.deleteOwned(obsolete); this.taskCleanupError = ""; }
+    catch { this.taskCleanupError = "旧探测任务清理未完成，将在下次同步重试；已暂停旧任务，不影响当前检测。"; }
+    const deleted = new Set(obsolete.map(t => t.id));
+    this.state.tasks = Object.fromEntries(Object.entries(this.state.tasks).filter(([key, id]) => !deleted.has(id) && (active ? desired.has(key) : !retiredKey(key))));
+    if (changedClients.size) {
+      this.resetMonitors(changedClients);
+      for (const event of this.state.events) if (event.delivery === "pending" && changedClients.has(event.client)) {
         event.delivery = "superseded";
         event.lastError = "探测源变化，旧通知已取消";
       }
@@ -158,11 +193,11 @@ export class Service {
     this.persist();
   }
 
-  private resetMonitors(): void {
+  private resetMonitors(changed = new Set(this.state.config.clients)): void {
     const previous = this.state.monitors;
     this.state.monitors = Object.fromEntries(this.state.config.clients.map(uuid => {
-      const monitor = newMonitor(this.clock(), previous[uuid]);
-      if (monitor.alarm && !this.state.config.strict) monitor.alarmDirection = "basic";
+      const monitor = previous[uuid] && !changed.has(uuid) ? previous[uuid] : newMonitor(this.clock(), previous[uuid]);
+      if (monitor.alarm && !forwardEnabled(this.state.config, uuid)) monitor.alarmDirection = "basic";
       return [uuid, monitor];
     }));
   }
@@ -171,7 +206,7 @@ export class Service {
     if (revision !== this.state.revision) throw new UserError("配置或服务器列表已变化，请刷新后重试");
     await this.refreshClients();
     const cfg = validateConfig(raw, new Set(this.clients.map(c => c.uuid)));
-    if (cfg.strict) for (const uuid of cfg.clients) reverseAddress(cfg, this.clients.find(c => c.uuid === uuid)!);
+    for (const uuid of cfg.clients.filter(id => forwardEnabled(cfg, id))) reverseAddress(cfg, this.clients.find(c => c.uuid === uuid)!);
     this.state.selectionNotice = selectionNotice(raw as Config, cfg);
     this.applyConfig(cfg, "检测配置变更，旧通知已取消");
     try { await this.reconcile(); this.lastError = ""; }
@@ -179,12 +214,13 @@ export class Service {
   }
 
   private applyConfig(cfg: Config, reason: string): void {
-    const changed = detectionSignature(cfg) !== detectionSignature(this.state.config);
+    const previous = this.state.config;
+    const changed = new Set([...previous.clients, ...cfg.clients].filter(id => !previous.clients.includes(id) || !cfg.clients.includes(id) || detectionSignature(cfg, id) !== detectionSignature(previous, id)));
     this.state.config = cfg;
     this.state.revision++;
-    if (changed) {
-      this.resetMonitors();
-      for (const event of this.state.events) if (event.delivery === "pending") { event.delivery = "superseded"; event.lastError = reason; }
+    if (changed.size) {
+      this.resetMonitors(changed);
+      for (const event of this.state.events) if (event.delivery === "pending" && changed.has(event.client)) { event.delivery = "superseded"; event.lastError = reason; }
     }
     this.persist();
   }
@@ -192,9 +228,10 @@ export class Service {
   private async samples(now: number): Promise<Record<string, Record<string, Sample[]>>> {
     const cfg = this.state.config;
     const data: Record<string, Record<string, Sample[]>> = Object.fromEntries(cfg.clients.map(id => [id, {}]));
-    const entities = [...new Set([...cfg.clients, ...(cfg.strict ? cfg.observers : [])])];
+    const forwardClients = cfg.clients.filter(id => forwardEnabled(cfg, id));
+    const entities = [...new Set([...cfg.clients, ...(forwardClients.length ? cfg.observers : [])])];
     const forward = new Map(cfg.targets.map(t => [String(this.state.tasks[`forward:${t.id}`]), t.id]));
-    const reverse = new Map(cfg.clients.map(id => [String(this.state.tasks[`reverse:${id}`]), id]));
+    const reverse = new Map(forwardClients.map(id => [String(this.state.tasks[`reverse:${id}`]), id]));
     for (let offset = 0; offset < entities.length; offset += 40) {
       const result = await this.rpc.call<{ series: MetricSeries[] }>("public:queryMetrics", {
         metric_keys: ["ping.latency_ms"], entity_ids: entities.slice(offset, offset + 40),
@@ -271,14 +308,20 @@ export class Service {
 
   private async maintainHistory(): Promise<void> {
     const now = this.clock();
-    if (now - this.retentionAttempt < 3600000 || !Object.keys(this.state.tasks).length) return;
+    if (now - this.retentionAttempt < 3600000 || (!Object.keys(this.state.tasks).length && !Object.keys(this.state.retiredTasks!).length)) return;
     this.retentionAttempt = now;
     try {
       const owned = new Map(Object.entries(this.state.tasks).map(([key, id]) => [id, this.taskName(key)]));
       await prunePingHistory(this.rpc, owned, this.metricPrefix, now);
+      const retired = Object.fromEntries(Object.entries(this.state.retiredTasks!).filter(([id, entry]) => this.visibility.has(id) && this.visibility.owns(entry.name)));
+      const collected = await collectRetiredHistory(this.rpc, retired, this.metricPrefix, now, this.clients.map(c => c.uuid));
+      this.visibility.forget(collected);
+      for (const id of collected) delete this.state.retiredTasks![id];
       this.retentionError = "";
     } catch {
       this.retentionError = "历史清理未完成，将于一小时后重试；请检查宿主数据库接口和插件权限。检测及告警不受此清理错误影响。";
+    } finally {
+      this.persist();
     }
   }
 
@@ -315,13 +358,16 @@ export class Service {
 
   async cleanup(): Promise<void> {
     if (this.state.config.enabled) throw new UserError("请先关闭监测再清理任务");
-    const all = await this.rpc.call<PingTask[] | null>("admin:getAllPingTasks") ?? [];
-    const id = all.filter(t => this.owns(t)).map(t => t.id);
-    if (id.length) await this.rpc.call("admin:deletePingTask", { id });
+    const all = await readPingTasks(this.rpc);
+    this.visibility.observe(all);
+    await this.deleteOwned(all.filter(t => this.owns(t)));
     this.state.tasks = {};
     this.state.sources = {};
     this.retentionError = "";
+    this.taskCleanupError = "";
     this.retentionAttempt = 0;
+    this.resetMonitors();
+    for (const monitor of Object.values(this.state.monitors)) monitor.health = "paused";
     this.persist();
   }
 
@@ -332,7 +378,7 @@ export class Service {
   }
 
   settings() {
-    return { config: this.state.config, revision: this.state.revision, clients: this.clients.map(c => safeClient(c, this.state.config.maskIp)), notification: this.notification, lastError: this.lastError, retentionError: this.retentionError, visibilityError: this.visibility.lastError, selectionNotice: this.state.selectionNotice ?? "", selectionNoticeRevision: this.state.revision };
+    return { config: this.state.config, revision: this.state.revision, clients: this.clients.map(c => safeClient(c, this.state.config.maskIp)), notification: this.notification, lastError: this.lastError, retentionError: [this.retentionError, this.taskCleanupError].filter(Boolean).join(" "), visibilityError: this.visibility.lastError, selectionNotice: this.state.selectionNotice ?? "", selectionNoticeRevision: this.state.revision };
   }
 
   snapshot() {
@@ -344,7 +390,8 @@ export class Service {
       const stale = keys.some(k => !m.latest[k] || now - m.latest[k].at > staleAfter(cfg));
       return {
         ...safeClient(client, cfg.maskIp), alarm: m.alarm, blockedSince: m.blockedSince,
-        alarmDirection: m.alarm ? (cfg.strict ? m.alarmDirection ?? "both" : "basic") : null,
+        forwardEnabled: forwardEnabled(cfg, uuid),
+        alarmDirection: m.alarm ? (forwardEnabled(cfg, uuid) ? m.alarmDirection ?? "both" : "basic") : null,
         candidateDirection: cfg.enabled && !stale && m.health === "suspect" ? m.candidateDirection ?? null : null,
         health: !cfg.enabled ? "paused" : stale && m.health !== "initializing" ? "unknown" : m.health,
         failureStreak: m.failureStreak, recoveryStreak: m.recoveryStreak, lastRoundAt: m.lastRoundAt,
@@ -358,7 +405,7 @@ export class Service {
     return {
       now, enabled: cfg.enabled, strict: cfg.strict, intervalSeconds: cfg.intervalSeconds,
       failureThreshold: cfg.failureThreshold, recoveryThreshold: cfg.recoveryThreshold,
-      rows, targets: cfg.targets, lastPoll: this.lastPoll, lastError: this.lastError, retentionError: this.retentionError, visibilityError: this.visibility.lastError, selectionNotice: this.state.selectionNotice ?? "", selectionNoticeRevision: this.state.revision, notification: this.notification,
+      rows, targets: cfg.targets, lastPoll: this.lastPoll, lastError: this.lastError, retentionError: [this.retentionError, this.taskCleanupError].filter(Boolean).join(" "), visibilityError: this.visibility.lastError, selectionNotice: this.state.selectionNotice ?? "", selectionNoticeRevision: this.state.revision, notification: this.notification,
       events: this.state.events.slice(-100).reverse().map(e => ({ ...e, name: safeClient(this.clients.find(c => c.uuid === e.client) ?? { uuid: e.client, name: "已删除服务器", ipv4: "", ipv6: "", group: "" }, cfg.maskIp).name })),
     };
   }

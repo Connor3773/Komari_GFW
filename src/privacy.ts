@@ -43,7 +43,7 @@ export function notificationEvent(event: Notice, client: Client, config: Config)
     ...(!blocked && direction !== "basic" ? [`原被墙状态：${blockText(direction)}`] : []),
     `反向（受检服务器到大陆目标）：${event.mainland}/3 可达`,
     `非大陆对照（受检服务器到非大陆目标）：${event.overseas}/2 可达`,
-    ...(event.reverseTotal ? [`正向（大陆探针到受检服务器）：${event.reverse}/${event.reverseTotal} 可达（严格模式）`] : []),
+    ...(event.reverseTotal ? [`正向（大陆探针到受检服务器）：${event.reverse}/${event.reverseTotal} 可达（正向检测）`] : []),
     ...(!blocked ? [`异常持续：${Math.max(0, Math.round((event.at - event.since) / 60000))} 分钟`] : []),
     `检测时间：${new Date(event.at).toISOString()}`,
   ];

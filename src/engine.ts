@@ -1,4 +1,4 @@
-import { monitorKeys } from "./config.ts";
+import { forwardEnabled, monitorKeys } from "./config.ts";
 import type { BlockDirection, Config, Evidence, Monitor, Sample, Transition } from "./types.ts";
 
 export function newMonitor(now: number, previous?: Monitor): Monitor {
@@ -18,8 +18,9 @@ export function resetStreaks(state: Monitor): void {
 export function staleAfter(config: Config): number { return config.intervalSeconds * 2000 + 15000; }
 
 export function evaluate(state: Monitor, samples: Record<string, Sample[]>, config: Config, uuid: string, now: number): Transition[] {
+  const strict = forwardEnabled(config, uuid);
   // Pre-0.1.5 strict alarms could only be bidirectional. Keep them without replay.
-  state.alarmDirection = state.alarm ? state.alarmDirection ?? (config.strict ? "both" : "basic") : null;
+  state.alarmDirection = state.alarm ? (strict ? state.alarmDirection ?? "both" : "basic") : null;
   const keys = monitorKeys(config, uuid);
   const events: Transition[] = [];
   const skew = Math.min(15000, config.intervalSeconds * 450);
@@ -58,7 +59,7 @@ export function evaluate(state: Monitor, samples: Record<string, Sample[]>, conf
     };
     let direction: BlockDirection | null = null;
     if (evidence.overseas >= config.overseasRequired) {
-      if (!config.strict) direction = evidence.mainland === 0 ? "basic" : null;
+      if (!strict) direction = evidence.mainland === 0 ? "basic" : null;
       else if (evidence.reverseTotal > 0) {
         if (evidence.mainland === 0 && evidence.reverse === 0) direction = "both";
         else if (evidence.mainland === 0 && evidence.reverse === evidence.reverseTotal) direction = "reverse";

@@ -45,6 +45,46 @@ test("overview distinguishes directional, pending and legacy event labels", () =
   assert.equal(context.observationText({ health: "unknown", candidateDirection: "reverse" }), "数据不足");
 });
 
+test("global forward off hides every per-server control without losing choices or drafts", () => {
+  class Element {
+    dataset: Record<string, string> = {};
+    children: Element[] = [];
+    attributes: Record<string, string> = {};
+    value = "";
+    checked = false;
+    hidden = false;
+    scrollTop = 0;
+    append(...children: Element[]) { this.children.push(...children); }
+    replaceChildren(...children: Element[]) { this.children = children; }
+    setAttribute(name: string, value: string) { this.attributes[name] = value; }
+    addEventListener() {}
+    querySelector() { return null; }
+  }
+  const elements = Object.fromEntries(["clients", "observers", "strict", "strict-options", "selected-count", "client-search", "observer-search"].map(id => [id, new Element()]));
+  const config = { clients: ["a", "b"], observers: ["c"], strict: false, reverse: { a: { enabled: true, port: 443, host: "probe.example.com" }, b: { enabled: false, port: 0, host: "unfinished/" } } };
+  const before = structuredClone(config);
+  const context = createContext({ document: { getElementById: (id: string) => elements[id], createElement: () => new Element(), activeElement: null }, fixture: { config, clients: ["a", "b", "c"].map(uuid => ({ uuid, name: uuid, group: "", ipv4: "", ipv6: "" })) } });
+  runInContext(source.replace(/\nstart\(\);\s*$/, "\nmodel = fixture;"), context);
+  const descendants = (root: Element): Element[] => root.children.flatMap(child => [child, ...descendants(child)]);
+  for (const globalEnabled of [false, true, false, true]) {
+    elements.strict.checked = globalEnabled;
+    context.renderServerSelection();
+    const controls = descendants(elements.clients);
+    const toggles = controls.filter(el => el.dataset.forwardClient);
+    const fields = controls.filter(el => /测试端口|测试地址/.test(el.attributes["aria-label"] ?? ""));
+    assert.equal(toggles.length, globalEnabled ? 2 : 0);
+    assert.equal(fields.length, globalEnabled ? 2 : 0);
+    assert.equal(elements["strict-options"].hidden, !globalEnabled);
+    assert.equal(controls.filter(el => el.dataset.serverId).length, 3);
+    assert.equal(controls.filter(el => el.dataset.serverId && el.checked).length, 2);
+    if (globalEnabled) {
+      assert.deepEqual(toggles.map(el => el.checked), [true, false]);
+      assert.deepEqual(fields.map(el => el.value), [443, "probe.example.com"]);
+    }
+    assert.deepEqual(config, before);
+  }
+});
+
 test("selection notice is shown once, acknowledged, expires in 8 seconds and does not hide real errors", async () => {
   const f = fixture();
   f.render(data()); await flush();

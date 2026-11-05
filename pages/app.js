@@ -72,7 +72,8 @@ function renderSelectionNotice(data) {
 
 function renderOverview(data) {
   view = data;
-  $("mode").textContent = !data.enabled ? "监测已暂停" : data.strict ? "严格模式 · 双向检测" : "基础模式 · 反向检测";
+  const forwardCount = data.rows.filter(row => row.forwardEnabled).length;
+  $("mode").textContent = !data.enabled ? "监测已暂停" : data.strict ? `反向检测 · 正向 ${forwardCount}/${data.rows.length} 台` : "仅反向检测 · 正向全局关闭";
   $("mode").className = "pill " + (data.enabled ? "good" : "");
   $("schedule").textContent = `每 ${data.intervalSeconds} 秒 · 告警 ${data.failureThreshold} 次 / 恢复 ${data.recoveryThreshold} 次`;
   $("last-poll").textContent = "上次采集 " + time(data.lastPoll);
@@ -115,6 +116,7 @@ function renderRows() {
     const server = node("td", undefined, "server");
     server.append(node("strong", row.name), node("small", row.ipv4 !== "未登记" ? row.ipv4 : row.ipv6 || "未登记", "mono"));
     if (row.group) server.append(node("small", row.group));
+    server.append(node("small", row.forwardEnabled ? "反向 + 正向" : "仅反向检测"));
     const status = node("td");
     status.append(node("span", row.alarm ? blockText(row.alarmDirection) : observationText(row), "pill " + (row.alarm ? "bad" : row.health === "healthy" ? "good" : ["suspect", "outage", "degraded"].includes(row.health) ? "warn" : "")));
     if (row.alarm) status.append(node("div", row.health === "suspect" && row.candidateDirection === row.alarmDirection ? "告警未解除" : `告警未解除 · ${observationText(row)}`, "small muted"));
@@ -130,6 +132,7 @@ function renderRows() {
     if (view.strict) {
       const td = node("td");
       const probes = node("div", undefined, "reverse-samples");
+      if (!row.forwardEnabled) probes.append(node("span", "未启用", "muted"));
       for (const sample of row.samples.filter(s => s.key.startsWith("reverse:"))) {
         const chip = node("span", `${sample.name} ${sampleText(sample)}`, sampleClass(sample));
         chip.title = time(sample.at); probes.append(chip);
@@ -157,27 +160,46 @@ function targetEditor(target, index) {
 function selection(client, selected, onChange) {
   const label = node("label", undefined, "choice");
   const checkbox = node("input"); checkbox.type = "checkbox"; checkbox.checked = selected;
+  checkbox.dataset.serverId = client.uuid;
   checkbox.addEventListener("change", () => onChange(checkbox.checked));
   const text = node("span", client.name); text.append(node("small", client.group || client.ipv4 || "未分组"));
   label.append(checkbox, text); return label;
 }
 function renderServerSelection() {
   const cfg = model.config;
+  const scrollTop = $("clients").scrollTop;
+  const focus = document.activeElement?.dataset;
+  const focusServer = focus?.serverId, focusForward = focus?.forwardClient;
   $("selected-count").textContent = `(${cfg.clients.length})`;
   $("strict-options").hidden = !$("strict").checked;
-  const query = $("client-search").value.toLowerCase();
-  $("clients").replaceChildren(...model.clients.filter(c => `${c.name} ${c.group}`.toLowerCase().includes(query)).map(client => {
+  const query = $("client-search").value.trim().toLowerCase();
+  $("clients").replaceChildren(...model.clients.filter(c => `${c.name} ${c.group} ${c.ipv4} ${c.ipv6}`.toLowerCase().includes(query)).map(client => {
     const row = node("div", undefined, "client-row");
+    row.dataset.client = client.uuid;
     const selected = cfg.clients.includes(client.uuid);
     row.append(selection(client, selected, checked => {
       cfg.clients = checked ? [...cfg.clients, client.uuid] : cfg.clients.filter(id => id !== client.uuid);
+      if (checked) cfg.reverse[client.uuid] ??= { enabled: false, port: 0, host: "" };
       markDirty(); renderServerSelection();
     }));
+    const current = cfg.reverse[client.uuid] ?? { enabled: false, port: 0, host: "" };
     if (selected && $("strict").checked) {
+      const toggle = node("input"); toggle.type = "checkbox"; toggle.checked = current.enabled === true;
+      toggle.dataset.forwardClient = client.uuid;
+      toggle.setAttribute("aria-label", `${client.name} 启用正向检测`);
+      const label = node("label", undefined, "switch per-forward");
+      label.title = "由境内探针检测本服务器";
+      label.append(toggle, node("span", "正向检测")); row.append(label);
+      toggle.addEventListener("change", () => {
+        cfg.reverse[client.uuid] = { ...current, ...cfg.reverse[client.uuid], enabled: toggle.checked };
+        markDirty(); renderServerSelection();
+      });
+    }
+    if (selected && $("strict").checked && current.enabled === true) {
       const fields = node("div", undefined, "reverse-fields");
-      const current = cfg.reverse[client.uuid] ?? { port: 0, host: "" };
       const port = node("input"); port.type = "number"; port.min = "1"; port.max = "65535"; port.required = true; port.placeholder = "例如 443"; port.value = current.port || "";
       const host = node("input"); host.placeholder = "留空使用登记 IP"; host.value = current.host; host.maxLength = 253; host.spellcheck = false;
+      port.setAttribute("aria-label", `${client.name} 测试端口`); host.setAttribute("aria-label", `${client.name} 测试地址`);
       port.addEventListener("input", () => { cfg.reverse[client.uuid] = { ...current, ...cfg.reverse[client.uuid], port: Number(port.value) }; });
       host.addEventListener("input", () => { cfg.reverse[client.uuid] = { ...current, ...cfg.reverse[client.uuid], host: host.value }; });
       fields.append(labelInput("测试端口", port), labelInput("测试地址（可选）", host)); row.append(fields);
@@ -185,6 +207,10 @@ function renderServerSelection() {
     return row;
   }));
   if (!model.clients.length) $("clients").append(node("p", "Komari 中还没有可选择的服务器。", "note"));
+  else if (!$("clients").children.length) $("clients").append(node("p", "没有匹配的服务器", "note"));
+  $("clients").scrollTop = scrollTop;
+  const focusTarget = focusForward ? $("clients").querySelector(`[data-forward-client="${focusForward}"]`) : focusServer ? $("clients").querySelector(`[data-server-id="${focusServer}"]`) : null;
+  focusTarget?.focus({ preventScroll: true });
   renderObserverSelection();
 }
 function renderObserverSelection() {
@@ -232,7 +258,7 @@ async function start() {
     $("strict").addEventListener("change", renderServerSelection);
     $("client-search").addEventListener("input", event => { event.stopPropagation(); renderServerSelection(); });
     $("observer-search").addEventListener("input", event => { event.stopPropagation(); renderObserverSelection(); });
-    $("observer-search").addEventListener("change", event => event.stopPropagation());
+    for (const id of ["client-search", "observer-search"]) $(id).addEventListener("change", event => event.stopPropagation());
     for (const id of ["client-search", "observer-search"]) $(id).addEventListener("keydown", event => { if (event.key === "Enter") event.preventDefault(); });
     $("settings-form").addEventListener("submit", event => {
       event.preventDefault();

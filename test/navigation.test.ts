@@ -19,6 +19,8 @@ test("plugin and feature display names match the requested names", () => {
   assert.match(read("pages/overview.html"), /<title>被墙检测总览<\/title>/);
   assert.match(read("pages/overview.html"), /<h1>被墙检测总览<\/h1>/);
   assert.match(read("pages/settings.html"), /<h1>被墙检测配置<\/h1>/);
+  assert.match(read("pages/settings.html"), /隐藏服务器 IP 后两段/);
+  assert.doesNotMatch(read("pages/settings.html"), /隐藏服务器 IPv4 后两段/);
   for (const page of ["overview", "settings"]) assert.doesNotMatch(read(`pages/${page}.html`), /GFW/);
 });
 
@@ -60,7 +62,7 @@ test("direction copy uses mainland-to-server as forward and server-to-mainland a
   assert.match(settings, /反向：受检服务器到 3 个大陆目标；对照：受检服务器到 2 个非大陆目标/);
   assert.match(settings, /正向 TCP 探测：大陆探针到受检服务器/);
   assert.match(settings, /解除要求反向 3\/3、非大陆对照 2\/2 和全部正向探针成功/);
-  assert.match(app, /基础模式 · 反向检测/);
+  assert.match(app, /仅反向检测 · 正向全局关闭/);
   assert.match(app, /正向探针（大陆出发）/);
   assert.doesNotMatch(overview + settings + app, /境内反向探针|正向 5\/5|基础模式 · 正向检测/);
 });
@@ -75,5 +77,5 @@ test("manifest declares the minimum host version and approved hook permission", 
   assert.equal(manifest.komari, ">=1.6.1");
   assert.equal(manifest.permissions.allowHooks, true);
   assert.equal(manifest.short, "komari-gfw");
-  assert.equal(manifest.version, "0.1.5");
+  assert.equal(manifest.version, "0.1.6");
 });
