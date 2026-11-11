@@ -338,7 +338,9 @@ test("WebSocket text/binary requests are correlated, filtered, restored and clea
     const reply = JSON.stringify({ jsonrpc: "2.0", id: wire.id, result: [own, user] });
     const outgoing = f.run("wsSend", "/api/rpc2", ctx, { data: reply });
     assert.deepEqual(JSON.parse(outgoing.data), { jsonrpc: "2.0", id: "id", result: [user] });
-    assert.equal(f.run("wsSend", "/api/rpc2", ctx, { data: reply }), undefined);
+    const stale = f.run("wsSend", "/api/rpc2", ctx, { data: reply });
+    assert.match(JSON.parse(stale.data).error.message, /Uncorrelated RPC response/);
+    assert.ok(!stale.data.includes(own.name));
     f.run("wsClose", "/api/rpc2", ctx);
   }
 });
@@ -361,6 +363,120 @@ test("REST JSON GET bodies cannot inject the filter header or hide the sample ca
   const res = { statusCode: 200, headers: {}, body: JSON.stringify({ status: "success", data: result([row(1), row(9, 10), row(9, 20, 1)]) }) };
   f.run("response", "GET /api/records/ping", { ...req, body: "" }, res);
   assert.deepEqual(JSON.parse(res.body).data.records, [row(9, 20, 1)]);
+});
+
+test("current Komari task, record, metric, stat and latest shapes stay filtered", () => {
+  const f = fixture();
+  const owned = { ...own, clients: null, default_on: false, type: "icmp", target: "example.com", interval: 60, weight: 0 };
+  const ordinary = { ...user, clients: null, default_on: true, type: "tcp", target: "example.org", interval: 60, weight: 1 };
+  assert.deepEqual(f.rpc("admin:getAllPingTasks", [owned, ordinary]).result, [ordinary]);
+
+  const records = {
+    from: "2026-11-09T00:00:00Z",
+    to: "2026-11-09T01:00:00Z",
+    records: [row(1, 1.5), row(9, 2.25)],
+    count: 2,
+    tasks: [owned, ordinary],
+  };
+  const visibleRecords = f.rpc("common:getRecords", records, { type: "ping" }).result;
+  assert.deepEqual(visibleRecords.records, [records.records[1]]);
+  assert.equal(visibleRecords.count, 1);
+  assert.equal(visibleRecords.from, records.from);
+  assert.deepEqual(visibleRecords.tasks, [ordinary]);
+
+  const point = (task: string, value: number | null, count?: number) => ({ time: "2026-11-09T00:00:00Z", value, ...(count === undefined ? {} : { count }), tags: { task_id: task } });
+  const ping = {
+    metric_key: "ping.latency_ms", entity_id: "node-a", type: "gauge", unit: "ms", retention_days: 30,
+    tags: { task_id: "9" }, downsampled: true, downsample_algorithm: "avg", fill_empty: true,
+    max_points: 500, interval_seconds: 60, count: 2, points: [point("9", 12.5, 4), point("9", null)],
+  };
+  const cpu = { metric_key: "cpu.usage", tags: {}, count: 1, points: [{ time: "2026-11-09T00:00:00Z", value: 1.5, count: 3 }] };
+  const metrics = f.rpc("public:queryMetrics", {
+    start: "2026-11-09T00:00:00Z", end: "2026-11-09T01:00:00Z", server_downsample_default: true, default_points: 500, series: [ping, cpu], count: 2,
+  }, { metric_key: "ping.latency_ms" }).result;
+  assert.equal(metrics.count, 2);
+  assert.equal(metrics.server_downsample_default, true);
+  assert.deepEqual(metrics.series[0].points, ping.points);
+  assert.deepEqual(metrics.series[1], cpu);
+
+  const userStat = { task_id: "9", entity_id: "a", name: "User task", total: 10, valid: 8, loss: 20, min: null, max: 30.5, avg: 12.25, latest: null, p50: 10, p99: 28 };
+  const stats = f.rpc("public:getPingMetricStats", { start: "s", end: "e", interval_seconds: 60, stats: [{ ...userStat, task_id: "1", name: own.name }, userStat], count: 2 }).result;
+  assert.deepEqual(stats, { start: "s", end: "e", interval_seconds: 60, stats: [userStat], count: 1 });
+
+  const summary = { name: "user", latest: 2.5, avg: 2, tail: 3, loss: 0, min: 1, max: 4 };
+  const node = { client: "a", time: "2026-11-09T00:00:00Z", cpu: 1, online: true, ping: { "1": { ...summary, name: own.name, loss: 100 }, "9": summary } };
+  const bare = { client: "b", cpu: 0, time: "t", online: false };
+  const latest = f.rpc("common:getNodesLatestStatus", { a: node, b: bare, c: null, d: { client: "d", ping: null } }).result;
+  assert.deepEqual(latest, { a: { ...node, ping: { "9": summary } }, b: bare, d: { client: "d", ping: null } });
+  assert.deepEqual(f.rpc("common:getNodesLatestStatus", bare).result, bare);
+  assert.equal(f.visibility.lastError, "");
+});
+
+test("missing attribution, wrapper pagination and a non-object ping map still fail closed", () => {
+  const f = fixture();
+  const missing = f.rpc("public:getPingRecords", { records: [{ value: 1, client: "a", time: row(9).time, note: own.name }, row(9)], count: 2 }, { uuid: "a" });
+  assert.equal(missing.result, undefined);
+  assert.match(missing.error.message, /POST \/api\/rpc2 public:getPingRecords \/ Unsupported ping record/);
+  assert.ok(!JSON.stringify(missing).includes(own.name));
+  const paged = f.rpc("public:getPingMetricStats", { stats: [{ task_id: "9", total: 1 }], count: 1, total: 9 });
+  assert.match(paged.error.message, /POST \/api\/rpc2 public:getPingMetricStats \/ Unsupported pagination/);
+  const badPing = f.rpc("common:getNodesLatestStatus", { a: { client: "a", cpu: 1, ping: own.name } });
+  assert.match(badPing.error.message, /Unsupported node ping summary/);
+  assert.ok(!JSON.stringify(badPing).includes(own.name));
+  const inherited = Object.assign(Object.create({ total: 99 }), { records: [row(9)], count: 1, tasks: [user] });
+  const filtered = filterResult(inherited, { kind: "records" }, f.visibility) as { records: unknown };
+  assert.deepEqual(filtered.records, [row(9)]);
+});
+
+test("a later successful filter clears the warning; errors and partial batches do not", () => {
+  const f = fixture();
+  const bad = f.rpc("public:getPingRecords", { ...result(), total: 2 }, { uuid: "a" });
+  assert.match(bad.error.message, /POST \/api\/rpc2 public:getPingRecords \/ Unsupported pagination/);
+  assert.equal(f.visibility.lastError, bad.error.message);
+  const native = f.prepare(request("public:getPingRecords", { uuid: "a" }));
+  f.finish(native.req, { jsonrpc: "2.0", id: native.data.id, error: { code: -32602, message: "Invalid request" } });
+  const denied = { statusCode: 403, headers: {}, body: "{}" };
+  f.run("response", "GET /api/task/ping", {}, denied);
+  const restError = { statusCode: 200, headers: {}, body: JSON.stringify({ status: "error", message: "denied" }) };
+  f.run("response", "GET /api/task/ping", {}, restError);
+  assert.match(f.visibility.lastError, /Unsupported pagination/);
+  const batch = f.prepare([request("public:getPublicPingTasks", {}, 1), request("public:getPingRecords", { uuid: "a" }, 2)]);
+  const mixed = f.finish(batch.req, [
+    { jsonrpc: "2.0", id: batch.data[0].id, result: [own, user] },
+    { jsonrpc: "2.0", id: batch.data[1].id, result: { ...result(), total: 1 } },
+  ]).data;
+  assert.deepEqual(mixed[0].result, [user]);
+  assert.match(mixed[1].error.message, /public:getPingRecords \/ Unsupported pagination/);
+  assert.match(f.visibility.lastError, /public:getPingRecords \/ Unsupported pagination/);
+  assert.deepEqual(f.rpc("public:getPublicPingTasks", [own, user]).result, [user]);
+  assert.equal(f.visibility.lastError, "");
+  const rest = { statusCode: 200, headers: {}, body: JSON.stringify({ status: "success", data: [own, user] }) };
+  f.visibility.warn("sticky");
+  f.run("response", "GET /api/admin/ping/*", { url: "/api/admin/ping" }, rest);
+  assert.deepEqual(JSON.parse(rest.body).data, [user]);
+  assert.equal(f.visibility.lastError, "");
+});
+
+test("WebSocket heartbeats do not consume a filtered request or record a failure", () => {
+  const f = fixture();
+  f.visibility.warn("sticky");
+  const ctx = { connId: 3 };
+  const incoming = f.run("wsMessage", "/api/rpc2", ctx, { data: JSON.stringify(request("public:getPublicPingTasks", {}, "id")) });
+  const wire = JSON.parse(incoming.data);
+  assert.equal(f.run("wsMessage", "/api/rpc2", ctx, { data: JSON.stringify({ jsonrpc: "2.0", method: "rpc.ping", params: { timestamp: 1 } }) }), undefined);
+  assert.equal(f.run("wsSend", "/api/rpc2", ctx, { data: '{"jsonrpc":"2.0","result":"pong"}\n' }), undefined);
+  assert.equal(f.run("wsSend", "/api/rpc2", ctx, { data: JSON.stringify({ jsonrpc: "2.0", id: 7, result: { version: "1.6.1" } }) }), undefined);
+  assert.equal(f.visibility.lastError, "sticky");
+  const outgoing = f.run("wsSend", "/api/rpc2", ctx, { data: JSON.stringify({ jsonrpc: "2.0", id: wire.id, result: [own, user] }) });
+  assert.deepEqual(JSON.parse(outgoing.data), { jsonrpc: "2.0", id: "id", result: [user] });
+  assert.equal(f.visibility.lastError, "");
+  const lost = f.run("wsMessage", "/api/rpc2", ctx, { data: JSON.stringify(request("public:getPublicPingTasks", {}, "next")) });
+  const forged = f.run("wsSend", "/api/rpc2", ctx, { data: JSON.stringify({ jsonrpc: "2.0", id: "km-filter-test-random-nonce-999", result: [own] }) });
+  assert.match(JSON.parse(forged.data).error.message, /WS \/api\/rpc2 \/ Uncorrelated RPC response/);
+  assert.ok(!forged.data.includes(own.name));
+  const real = f.run("wsSend", "/api/rpc2", ctx, { data: JSON.stringify({ jsonrpc: "2.0", id: JSON.parse(lost.data).id, result: [own, user] }) });
+  assert.deepEqual(JSON.parse(real.data).result, [user]);
+  assert.equal(f.visibility.lastError, "");
 });
 
 test("large filtering is linear before optional sampling, does not mutate the raw source", t => {
