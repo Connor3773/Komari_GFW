@@ -45,6 +45,23 @@ test("overview distinguishes directional, pending and legacy event labels", () =
   assert.equal(context.observationText({ health: "unknown", candidateDirection: "reverse" }), "数据不足");
 });
 
+test("administrator diagnostics retain last failure even after recovery, rendered as text", () => {
+  const f = fixture();
+  const details = { hidden: true };
+  let rows: any[] = [];
+  const failures = { replaceChildren(...items: any[]) { rows = items; } };
+  (f.document as any).getElementById = (id: string) => id === "visibility-diagnostics" ? details : failures;
+  f.context.node = (_tag: string, text: string) => ({ textContent: text });
+  f.context.renderVisibilityDiagnostics({ visibilityDiagnostics: [{ entry: "WS /api/rpc2 public:getPingRecords", check: "Unsupported pagination", lastFailedAt: 1700000000000, occurrences: 3, recoveredAt: null }] });
+  assert.equal(details.hidden, false);
+  assert.match(rows[0].textContent, /未恢复.*WS \/api\/rpc2 public:getPingRecords.*Unsupported pagination.*3 次/);
+  f.context.renderVisibilityDiagnostics({ visibilityDiagnostics: [{ entry: "POST /api/rpc2", check: "<script>", lastFailedAt: 1700000000000, occurrences: 1, recoveredAt: 1700000000001 }] });
+  assert.match(rows[0].textContent, /已恢复/);
+  assert.match(rows[0].textContent, /<script>/);
+  f.context.renderVisibilityDiagnostics({ visibilityDiagnostics: [] });
+  assert.equal(details.hidden, true);
+});
+
 test("global forward off hides every per-server control without losing choices or drafts", () => {
   class Element {
     dataset: Record<string, string> = {};

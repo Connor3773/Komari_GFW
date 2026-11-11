@@ -528,12 +528,31 @@ try {
   assert.ok(!(await overviewFrame.locator("body").innerText()).includes("203.0.113.25"));
   await page.screenshot({ path: join(root, "overview-desktop.png"), fullPage: true });
   const configPage = page;
+  // Exercise a real request-hook failure before opening the configuration UI.
+  // The host must reject the ambiguous request, never return raw Ping tasks.
+  const ambiguous = await fetch(base + "/api/rpc2", { method: "POST", headers: { Cookie: cookie, "Content-Type": "application/json" }, body: '{"jsonrpc":"2.0","id":1,"method":"public:getPublicPingTasks","method":"public:getVersion"}' });
+  assert.equal(ambiguous.status, 500);
+  assert.ok(!(await ambiguous.text()).includes("[Komari GFW:"));
+  const failureState = await plugin("overview");
+  assert.match(failureState.visibilityError, /POST \/api\/rpc2 request \/ Ambiguous duplicate JSON key/);
+  assert.ok(failureState.visibilityDiagnostics.some(d => d.entry === "POST /api/rpc2 request" && d.recoveredAt === null));
+  await rpc("public:getVersion");
+  assert.ok((await plugin("overview")).visibilityError, "An unrelated RPC cannot clear a warning");
   await configPage.goto(base + "/admin/plugins/config?short=komari-gfw");
   const configFrame = configPage.frameLocator('iframe[title="被墙检测配置"]');
   await configFrame.getByRole("heading", { name: "被墙检测配置", exact: true }).waitFor();
   assert.equal(await configFrame.locator("header a, header nav").count(), 0);
   await configFrame.locator("#settings-fields").waitFor();
   await waitFor(async () => !(await configFrame.locator("#settings-fields").isDisabled()), "Settings enabled");
+  await configFrame.locator("#visibility-diagnostics summary").click();
+  await configFrame.locator("#visibility-failures").getByText(/Ambiguous duplicate JSON key/).waitFor();
+  await rpc("public:getPublicPingTasks");
+  const recoveredVisibility = await plugin("overview");
+  assert.equal(recoveredVisibility.visibilityError, "");
+  assert.ok(recoveredVisibility.visibilityDiagnostics.some(d => d.check === "Ambiguous duplicate JSON key" && d.recoveredAt !== null));
+  await waitFor(async () => (await configFrame.locator("#visibility-failures").innerText()).includes("已恢复"), "Recovered diagnostics retained in UI without reloading", 15000);
+  assert.equal(await configFrame.locator("#message").isHidden(), true);
+  console.log("PASS: real request failure is scoped, fails closed and remains in administrator diagnostics after recovery");
   assert.equal(await configFrame.locator("#strict").isChecked(), true);
   assert.equal(await configPage.getByRole("button", { name: /保存并重载|Save and reload/i }).isVisible(), false);
   const observerSearch = configFrame.getByRole("searchbox", { name: "搜索境内探针", exact: true });
@@ -659,7 +678,9 @@ try {
   await configPage.screenshot({ path: join(root, "probes-mobile.png"), fullPage: true });
   await observerSearch.fill("");
   await configPage.locator("nav button[aria-label]").first().click();
-  await configPage.getByRole("link", { name: "被墙检测总览", exact: true }).click();
+  const overviewLink = configPage.getByRole("link", { name: "被墙检测总览", exact: true });
+  await overviewLink.scrollIntoViewIfNeeded();
+  await overviewLink.press("Enter");
   await configPage.waitForURL(base + overviewPath);
   await closeMobileMenu();
   const mobileOverview = configPage.frameLocator("iframe.km-plugin-frame");

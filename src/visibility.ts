@@ -8,10 +8,19 @@ const id = (v: unknown): string => typeof v === "number" && Number.isSafeInteger
 const failureLead = "被墙检测无法安全过滤此响应";
 const failureTail = "请缩小查询范围并检查宿主兼容性；未返回该项数据";
 const failure = `${failureLead}，${failureTail}`;
+export interface VisibilityFailure {
+  entry: string; check: string; firstFailedAt: number; lastFailedAt: number;
+  occurrences: number; recoveredAt: number | null;
+}
 
 export class TaskVisibility {
   private ids: Set<string>;
-  lastError = "";
+  private failures = new Map<string, VisibilityFailure>();
+  get lastError(): string {
+    return [...this.failures.values()].filter(f => f.recoveredAt === null).map(f =>
+      `${failureLead}（${f.entry} / ${f.check} / ${new Date(f.lastFailedAt).toISOString()}）；${failureTail}`).join(" ");
+  }
+  get diagnostics(): VisibilityFailure[] { return [...this.failures.values()].map(f => ({ ...f })).sort((a, b) => b.lastFailedAt - a.lastFailedAt); }
   constructor(privateState: State) {
     this.state = privateState;
     this.ids = new Set((privateState.hiddenTaskIds ?? Object.values(privateState.tasks)).map(id).filter(Boolean));
@@ -40,8 +49,15 @@ export class TaskVisibility {
     for (const value of verifiedIds) this.ids.delete(id(value));
     this.state.hiddenTaskIds = [...this.ids].map(Number);
   }
-  warn(message = failure): void { this.lastError = message; }
-  clear(): void { this.lastError = ""; }
+  warn(entry: string, check: string, at: number): void {
+    const previous = this.failures.get(entry);
+    this.failures.set(entry, { entry, check, firstFailedAt: previous?.firstFailedAt ?? at,
+      lastFailedAt: at, occurrences: (previous?.occurrences ?? 0) + 1, recoveredAt: null });
+  }
+  clear(entry: string, at: number): void {
+    const previous = this.failures.get(entry);
+    if (previous && previous.recoveredAt === null) previous.recoveredAt = at;
+  }
 }
 
 export type FilterKind = "tasks" | "records" | "metrics" | "stats" | "latest";
@@ -51,6 +67,11 @@ function list(value: unknown): Obj[] {
   if (value === null) return [];
   if (!Array.isArray(value) || !value.every(object)) throw new Error("Unsupported list");
   return value;
+}
+function taskList(value: unknown): Obj[] {
+  const tasks = list(value);
+  if (tasks.some(t => !id(t.id) || typeof t.name !== "string")) throw new Error("Unsupported task identity");
+  return tasks;
 }
 const PAGINATION_KEYS = ["total", "total_count", "next_cursor", "has_more", "offset", "page", "pagination"];
 function countShape(value: Obj, field: string, rows: Obj[]): void {
@@ -98,7 +119,7 @@ function basicInfo(records: Obj[]): Obj[] {
 
 export function filterResult(value: unknown, selection: Selection, visibility: TaskVisibility): unknown {
   if (selection.kind === "tasks") {
-    const tasks = list(value);
+    const tasks = taskList(value);
     visibility.observe(tasks);
     const visible = tasks.filter(t => !visibility.has(t.id));
     return visible.length === tasks.length ? value : visible;
@@ -107,7 +128,7 @@ export function filterResult(value: unknown, selection: Selection, visibility: T
   if (selection.kind === "records") {
     const records = list(value.records);
     countShape(value, "records", records);
-    const tasks = value.tasks == null ? [] : list(value.tasks);
+    const tasks = value.tasks == null ? [] : taskList(value.tasks);
     visibility.observe(tasks);
     for (const r of records) if (!id(r.task_id) || typeof r.value !== "number" || !Number.isFinite(r.value) || !Number.isFinite(Date.parse(r.time)) || (r.client !== undefined && typeof r.client !== "string")) throw new Error("Unsupported ping record");
     const kept = records.filter(r => !visibility.has(r.task_id));
@@ -141,6 +162,7 @@ export function filterResult(value: unknown, selection: Selection, visibility: T
   if (selection.kind === "stats") {
     const stats = list(value.stats);
     countShape(value, "stats", stats);
+    if (stats.some(s => !id(s.task_id))) throw new Error("Unsupported task identity");
     visibility.observe(stats.map(s => ({ id: s.task_id, name: s.name })));
     const kept = stats.filter(s => !visibility.has(s.task_id) && !visibility.has(s.tags?.task_id) && !visibility.has(s.labels?.task_id));
     return { ...value, stats: kept, count: kept.length };
@@ -148,16 +170,16 @@ export function filterResult(value: unknown, selection: Selection, visibility: T
   const cleanNode = (node: Obj): Obj => {
     // A missing or null ping dictionary has no task keys to leak.
     if (!("ping" in node) || node.ping === null) return node;
-    if (!object(node.ping)) throw new Error("Unsupported node ping summary");
+    if (!object(node.ping) || Object.keys(node.ping).some(key => !id(key))) throw new Error("Unsupported node ping summary");
     return { ...node, ping: Object.fromEntries(Object.entries(node.ping).filter(([key]) => !visibility.has(key))) };
   };
   // common:getNodesLatestStatus returns one record or a uuid → record map.
   const singleNode = typeof value.client === "string" && ("ping" in value || "cpu" in value || "time" in value || "online" in value);
   if (singleNode) return cleanNode(value);
-  return Object.fromEntries(Object.entries(value).flatMap(([key, node]) => {
-    if (node === null) return [];
+  return Object.fromEntries(Object.entries(value).map(([key, node]) => {
+    if (node === null) return [key, null];
     if (!object(node)) throw new Error("Unsupported node map");
-    return [[key, cleanNode(node)]];
+    return [key, cleanNode(node)];
   }));
 }
 
@@ -203,6 +225,14 @@ const HEADER = "x-komari-gfw-filter";
 const MAX_PENDING = 256;
 const MAX_BATCH = 1000;
 const TTL = 120000;
+// Never expose JSON parser excerpts or a raw response in administrator diagnostics.
+const CHECKS = new Set(["Unsupported list", "Unsupported records count/pagination", "Unsupported series count/pagination",
+  "Unsupported points count/pagination", "Unsupported stats count/pagination", "Unsupported pagination", "Unsupported result",
+  "Unsupported ping record", "Unsupported task identity", "Unsupported metric key", "Unsupported node ping summary", "Unsupported node map",
+  "Ambiguous duplicate JSON key", "Ping filter batch limit exceeded", "Ping filter correlation limit exceeded",
+  "Unsupported RPC envelope", "Ambiguous RPC response", "Uncorrelated RPC response", "Incomplete RPC response",
+  "Duplicate RPC response", "Too many pending connections", "Too many pending Ping requests", "Overlapping Ping request",
+  "Unsupported WebSocket frame", "Unsupported REST envelope"]);
 
 // Go decodes a repeated string field followed by null differently from JSON.parse.
 // Reject ambiguous duplicate keys rather than accidentally miss a Ping method.
@@ -228,16 +258,16 @@ function uniqueKeys(body: string): void {
 export class PingResponseFilter {
   private sequence = 0;
   private pending = new Map<string, { at: number; prepared: Correlation }>();
-  private sockets = new Map<number, Correlation>();
+  private sockets = new Map<number, { at: number; prepared: Correlation }>();
   private visibility: TaskVisibility;
   private nonce: string;
   private clock: () => number;
   constructor(visibility: TaskVisibility, nonce: string, clock = Date.now) { this.visibility = visibility; this.nonce = nonce; this.clock = clock; }
   private token(): string { return `km-filter-${this.nonce}-${++this.sequence}`; }
-  private checkOf(error: unknown): string { return error instanceof Error && error.message ? error.message : "filter"; }
+  private checkOf(error: unknown): string { return error instanceof Error && CHECKS.has(error.message) ? error.message : "Unsupported response JSON"; }
   private report(where: string, check: string): string {
     const message = `${failureLead}（${where} / ${check}）；${failureTail}`;
-    this.visibility.warn(message);
+    this.visibility.warn(where, check, this.clock());
     return message;
   }
   private ownsToken(id: unknown): boolean { return typeof id === "string" && id.startsWith(`km-filter-${this.nonce}-`); }
@@ -287,39 +317,44 @@ export class PingResponseFilter {
     catch { throw new Error("Unsupported RPC envelope"); }
     uniqueKeys(body);
     const messages = Array.isArray(data) ? data : [data];
-    let failed = false;
-    let filtered = false;
+    if (!messages.length) throw new Error("Incomplete RPC response");
+    const seen = new Set<string>();
+    const successful = new Set<string>(), failed = new Set<string>();
     for (const res of messages) {
       if (!object(res) || res.jsonrpc !== "2.0") throw new Error("Unsupported RPC envelope");
+      if (("error" in res) === ("result" in res)) throw new Error("Ambiguous RPC response");
       const selection = prepared.selections.get(res.id);
       if (!selection) {
         if (!("error" in res) && !prepared.untouchedIds.has(JSON.stringify(res.id ?? null))) throw new Error("Uncorrelated RPC response");
         continue;
       }
+      if (seen.has(res.id)) throw new Error("Duplicate RPC response");
+      seen.add(res.id);
       res.id = selection.originalId;
       if ("error" in res) {
-        if ("result" in res) throw new Error("Ambiguous RPC response");
         continue;
       }
       const where = `${transport} ${selection.method ?? selection.kind}`;
       try {
         res.result = filterResult(res.result, selection, this.visibility);
-        filtered = true;
+        successful.add(where);
       } catch (error) {
-        failed = true;
+        failed.add(where);
         delete res.result;
         res.error = { code: -32603, message: this.report(where, this.checkOf(error)) };
       }
     }
-    if (filtered && !failed) this.visibility.clear();
+    if (seen.size && seen.size !== prepared.selections.size) throw new Error("Incomplete RPC response");
+    for (const where of successful) if (!failed.has(where)) this.visibility.clear(where, this.clock());
+    if (successful.size && !failed.size) this.visibility.clear(transport, this.clock());
     return JSON.stringify(data);
   }
   private sweep(): void {
     const cutoff = this.clock() - TTL;
     for (const [key, value] of this.pending) if (value.at < cutoff) this.pending.delete(key);
+    for (const [key, value] of this.sockets) if (value.at < cutoff) this.sockets.delete(key);
   }
-  private fail(res: HookResponse, where: string, check: string): void {
-    const message = this.report(where, check);
+  private fail(res: HookResponse, where: string, check: string, message = this.report(where, check)): void {
     res.statusCode = 502;
     res.headers["content-type"] = "application/json; charset=utf-8";
     res.headers["x-content-type-options"] = "nosniff";
@@ -346,11 +381,14 @@ export class PingResponseFilter {
       let params;
       try { params = JSON.parse(req.body); } catch { return; }
       if (!object(params)) return;
-      const prepared = this.prepare(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "public:getPingRecords", params }));
-      if (prepared) {
-        this.remember(req, prepared, "GET /api/records/ping");
-        req.body = JSON.stringify(JSON.parse(prepared.body).params);
-      }
+      try {
+        const prepared = this.prepare(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "public:getPingRecords", params }));
+        if (prepared) {
+          this.remember(req, prepared);
+          req.body = JSON.stringify(JSON.parse(prepared.body).params);
+          this.visibility.clear("GET /api/records/ping request", this.clock());
+        }
+      } catch (error) { this.report("GET /api/records/ping request", this.checkOf(error)); throw error; }
     });
     server.hook("response", "GET /api/records/ping", (req: HookRequest, res: HookResponse) => {
       const entry = this.take(req);
@@ -359,8 +397,13 @@ export class PingResponseFilter {
     });
     server.hook("request", "POST /api/rpc2", (req: HookRequest) => {
       delete req.headers[HEADER];
-      const prepared = this.prepare(req.body);
-      if (prepared) { this.remember(req, prepared, "POST /api/rpc2"); req.body = prepared.body; }
+      try {
+        const prepared = this.prepare(req.body);
+        if (prepared) {
+          this.remember(req, prepared); req.body = prepared.body;
+          this.visibility.clear("POST /api/rpc2 request", this.clock());
+        }
+      } catch (error) { this.report("POST /api/rpc2 request", this.checkOf(error)); throw error; }
     });
     server.hook("response", "POST /api/rpc2", (req: HookRequest, res: HookResponse) => {
       if (!req.headers[HEADER]) return;
@@ -368,50 +411,64 @@ export class PingResponseFilter {
       this.headers(res);
       if (!prepared) return this.fail(res, "POST /api/rpc2", "Uncorrelated RPC response");
       try { res.body = this.rpcResponse(res.body, prepared, "POST /api/rpc2"); }
-      catch (error) { this.fail(res, "POST /api/rpc2", this.checkOf(error)); }
+      catch (error) { this.failCorrelation(res, prepared, "POST /api/rpc2", this.checkOf(error)); }
     });
-    server.hook("wsMessage", "/api/rpc2", (ctx: { connId: number }, msg: { data: unknown }) => {
+    server.hook("wsMessage", "/api/rpc2", (ctx: { connId: number }, msg: { data: unknown; type?: number }) => {
       // 1.6.1 and current main read one request and write its response before the
       // next read. A heartbeat or other method must not drop a filtered request
       // that is still waiting, and must not be recorded as a filter failure.
+      if (msg.type !== undefined && msg.type !== 1 && msg.type !== 2) return;
       try {
+        this.sweep();
         const body = frameText(msg.data);
         const prepared = this.prepare(body);
-        if (!prepared) return;
-        if (this.sockets.size >= MAX_PENDING && !this.sockets.has(ctx.connId)) {
-          this.report("WS /api/rpc2", "Too many pending connections");
-          return { data: "{", type: 1 };
+        if (!prepared) {
+          const waiting = this.sockets.get(ctx.connId)?.prepared;
+          if (waiting) {
+            let request;
+            try { request = JSON.parse(body); } catch { return; }
+            for (const item of Array.isArray(request) ? request : [request]) {
+              if (object(item) && field(item, "jsonrpc", true) === "2.0" && typeof field(item, "method", true) === "string") {
+                const key = JSON.stringify(field(item, "id") ?? null);
+                if (waiting.untouchedIds.size >= MAX_BATCH || [...waiting.untouchedIds].reduce((n, id) => n + id.length, key.length) > 65536) throw new Error("Ping filter correlation limit exceeded");
+                waiting.untouchedIds.add(key);
+              }
+            }
+          }
+          return;
         }
-        this.sockets.set(ctx.connId, { selections: prepared.selections, untouchedIds: prepared.untouchedIds });
+        if (this.sockets.has(ctx.connId)) throw new Error("Overlapping Ping request");
+        if (this.sockets.size >= MAX_PENDING) throw new Error("Too many pending connections");
+        this.sockets.set(ctx.connId, { at: this.clock(), prepared: { selections: prepared.selections, untouchedIds: prepared.untouchedIds } });
+        this.visibility.clear("WS /api/rpc2 request", this.clock());
         return { data: prepared.body, type: 1 };
       } catch (error) {
-        this.report("WS /api/rpc2", this.checkOf(error));
+        this.report("WS /api/rpc2 request", this.checkOf(error));
         // A frame hook exception would pass through. Invalid JSON invokes a native
         // protocol error instead; never drop silently or leave the client hanging.
         return { data: "{", type: 1 };
       }
     });
-    server.hook("wsSend", "/api/rpc2", (ctx: { connId: number }, msg: { data: unknown }) => {
-      const prepared = this.sockets.get(ctx.connId);
+    server.hook("wsSend", "/api/rpc2", (ctx: { connId: number }, msg: { data: unknown; type?: number }) => {
+      // Control payloads are not JSON-RPC. They never consume or recover an RPC.
+      if (msg.type !== undefined && msg.type !== 1 && msg.type !== 2) return;
+      const prepared = this.sockets.get(ctx.connId)?.prepared;
       const reject = (check: string) => {
-        const message = this.report("WS /api/rpc2", check);
+        const message = this.reportCorrelation(prepared, "WS /api/rpc2", check);
         return { data: JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32603, message } }), type: 1 };
       };
       let text: string;
       try { text = frameText(msg.data); }
       catch (error) {
         if (!prepared) return;
-        this.sockets.delete(ctx.connId);
         return reject(this.checkOf(error));
       }
-      // Heartbeats and other methods do not carry our wire id. Skip them without
-      // dropping a filtered request that is still waiting for its own response.
-      if (!prepared && !text.includes(`km-filter-${this.nonce}-`)) return;
+      // Parse IDs before deciding passthrough: JSON can escape our wire prefix.
+      // Only a recorded unrelated reply may bypass a still-pending selection.
       let parsed: unknown;
       try { parsed = JSON.parse(text); }
       catch {
         if (!prepared && !text.includes(`km-filter-${this.nonce}-`)) return;
-        if (prepared) this.sockets.delete(ctx.connId);
         return reject("Unsupported RPC envelope");
       }
       const messages = Array.isArray(parsed) ? parsed : [parsed];
@@ -421,6 +478,8 @@ export class PingResponseFilter {
         // it. Reject that frame. Keep a different in-flight selection so its real
         // response can still be filtered.
         if (messages.some(message => object(message) && this.ownsToken(message.id))) return reject("Uncorrelated RPC response");
+        if (prepared && !messages.every(message => object(message) && message.jsonrpc === "2.0" &&
+          (("error" in message && !("result" in message)) || ("result" in message && !("error" in message) && prepared.untouchedIds.has(JSON.stringify(message.id ?? null)))))) return reject("Uncorrelated RPC response");
         return;
       }
       this.sockets.delete(ctx.connId);
@@ -429,9 +488,19 @@ export class PingResponseFilter {
     });
     server.hook("wsClose", "/api/rpc2", (ctx: { connId: number }) => this.sockets.delete(ctx.connId));
   }
-  private remember(req: HookRequest, prepared: Prepared, where: string): void {
+  private reportCorrelation(prepared: Correlation | undefined, transport: string, check: string): string {
+    const methods = new Set(prepared ? [...prepared.selections.values()].map(s => `${transport} ${s.method ?? s.kind}`) : [transport]);
+    let message = failure;
+    for (const where of methods) message = this.report(where, check);
+    return message;
+  }
+  private failCorrelation(res: HookResponse, prepared: Correlation, transport: string, check: string): void {
+    const message = this.reportCorrelation(prepared, transport, check);
+    this.fail(res, transport, check, message);
+  }
+  private remember(req: HookRequest, prepared: Prepared): void {
     this.sweep();
-    if (this.pending.size >= MAX_PENDING) { this.report(where, "Too many pending Ping requests"); throw new Error("Too many pending Ping requests"); }
+    if (this.pending.size >= MAX_PENDING) throw new Error("Too many pending Ping requests");
     const token = this.token();
     this.pending.set(token, { at: this.clock(), prepared: { selections: prepared.selections, untouchedIds: prepared.untouchedIds } });
     req.headers[HEADER] = token;
@@ -451,10 +520,10 @@ export class PingResponseFilter {
       if (body.status === "error") return;
       if (body.status !== "success") throw new Error("Unsupported REST envelope");
       // Standard bridge omits a nil result's data.
-      if (!("data" in body) && selection.kind === "tasks") { this.visibility.clear(); return; }
+      if (!("data" in body) && selection.kind === "tasks") { this.visibility.clear(where, this.clock()); return; }
       body.data = filterResult(body.data, selection, this.visibility);
       res.body = JSON.stringify(body);
-      this.visibility.clear();
+      this.visibility.clear(where, this.clock());
     } catch (error) {
       const check = error instanceof SyntaxError ? "Unsupported REST envelope" : this.checkOf(error);
       this.fail(res, where, check);

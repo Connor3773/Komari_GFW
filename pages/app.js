@@ -48,6 +48,14 @@ async function api(path, body) {
 function noticeStatus(info) {
   $("notification-status").textContent = info ? `${info.ready ? "通知就绪" : "通知未就绪"} · ${info.reason}` : "通知状态未知";
 }
+function renderVisibilityDiagnostics(data) {
+  const details = $("visibility-diagnostics");
+  if (!details) return;
+  const rows = data.visibilityDiagnostics ?? [];
+  details.hidden = !rows.length;
+  $("visibility-failures").replaceChildren(...rows.map(item => node("p",
+    `${item.recoveredAt == null ? "未恢复" : "已恢复"} · ${time(item.lastFailedAt)} · ${item.entry} · ${item.check} · 累计 ${item.occurrences} 次`, "small muted")));
+}
 function sampleText(sample) { return sample?.value == null ? "无数据" : sample.value < 0 ? "不通" : `${sample.value} ms`; }
 function sampleClass(sample) { return sample?.value == null ? "sample-unknown" : sample.value < 0 ? "sample-bad" : "sample-ok"; }
 
@@ -82,6 +90,7 @@ function renderOverview(data) {
   $("stats").replaceChildren(...stats.map(([label, value, cls]) => { const el = node("div", undefined, "stat " + cls); el.append(node("strong", String(value)), node("span", label)); return el; }));
   noticeStatus(data.notification);
   showMessage([data.lastError, data.retentionError, data.visibilityError].filter(Boolean).join(" "));
+  renderVisibilityDiagnostics(data);
   renderSelectionNotice(data);
   renderRows();
   $("events").replaceChildren(...data.events.map(event => {
@@ -232,6 +241,7 @@ function renderSettings(data) {
   $("settings-fields").disabled = false;
   dirty = false; $("dirty").textContent = "所有更改已保存";
   showMessage([data.lastError, data.retentionError, data.visibilityError].filter(Boolean).join(" "));
+  renderVisibilityDiagnostics(data);
   renderSelectionNotice(data);
 }
 
@@ -276,6 +286,16 @@ async function start() {
     });
     window.addEventListener("beforeunload", event => { if (dirty) { event.preventDefault(); event.returnValue = ""; } });
     try { renderSettings(await api("settings")); } catch (error) { showMessage(error.message); }
+    setInterval(() => {
+      if (document.hidden || busy || !model) return;
+      api("overview").then(data => {
+        renderVisibilityDiagnostics(data);
+        if (data.visibilityError !== model.visibilityError) {
+          model.visibilityError = data.visibilityError;
+          showMessage([data.lastError, data.retentionError, data.visibilityError].filter(Boolean).join(" "));
+        }
+      }).catch(() => {});
+    }, 10000);
   }
 }
 start();

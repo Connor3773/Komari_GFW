@@ -407,7 +407,7 @@ test("current Komari task, record, metric, stat and latest shapes stay filtered"
   const node = { client: "a", time: "2026-11-09T00:00:00Z", cpu: 1, online: true, ping: { "1": { ...summary, name: own.name, loss: 100 }, "9": summary } };
   const bare = { client: "b", cpu: 0, time: "t", online: false };
   const latest = f.rpc("common:getNodesLatestStatus", { a: node, b: bare, c: null, d: { client: "d", ping: null } }).result;
-  assert.deepEqual(latest, { a: { ...node, ping: { "9": summary } }, b: bare, d: { client: "d", ping: null } });
+  assert.deepEqual(latest, { a: { ...node, ping: { "9": summary } }, b: bare, c: null, d: { client: "d", ping: null } });
   assert.deepEqual(f.rpc("common:getNodesLatestStatus", bare).result, bare);
   assert.equal(f.visibility.lastError, "");
 });
@@ -428,11 +428,11 @@ test("missing attribution, wrapper pagination and a non-object ping map still fa
   assert.deepEqual(filtered.records, [row(9)]);
 });
 
-test("a later successful filter clears the warning; errors and partial batches do not", () => {
+test("only the same entry and method recovers its warning, retaining the last failure", () => {
   const f = fixture();
   const bad = f.rpc("public:getPingRecords", { ...result(), total: 2 }, { uuid: "a" });
   assert.match(bad.error.message, /POST \/api\/rpc2 public:getPingRecords \/ Unsupported pagination/);
-  assert.equal(f.visibility.lastError, bad.error.message);
+  assert.match(f.visibility.lastError, /POST \/api\/rpc2 public:getPingRecords \/ Unsupported pagination/);
   const native = f.prepare(request("public:getPingRecords", { uuid: "a" }));
   f.finish(native.req, { jsonrpc: "2.0", id: native.data.id, error: { code: -32602, message: "Invalid request" } });
   const denied = { statusCode: 403, headers: {}, body: "{}" };
@@ -449,34 +449,220 @@ test("a later successful filter clears the warning; errors and partial batches d
   assert.match(mixed[1].error.message, /public:getPingRecords \/ Unsupported pagination/);
   assert.match(f.visibility.lastError, /public:getPingRecords \/ Unsupported pagination/);
   assert.deepEqual(f.rpc("public:getPublicPingTasks", [own, user]).result, [user]);
-  assert.equal(f.visibility.lastError, "");
+  assert.match(f.visibility.lastError, /public:getPingRecords/);
   const rest = { statusCode: 200, headers: {}, body: JSON.stringify({ status: "success", data: [own, user] }) };
-  f.visibility.warn("sticky");
   f.run("response", "GET /api/admin/ping/*", { url: "/api/admin/ping" }, rest);
   assert.deepEqual(JSON.parse(rest.body).data, [user]);
+  assert.match(f.visibility.lastError, /public:getPingRecords/);
+  f.rpc("public:getPingRecords", result(), { uuid: "a" });
   assert.equal(f.visibility.lastError, "");
+  const [history] = f.visibility.diagnostics;
+  assert.equal(history.entry, "POST /api/rpc2 public:getPingRecords");
+  assert.equal(history.check, "Unsupported pagination");
+  assert.equal(history.occurrences, 2);
+  assert.equal(history.lastFailedAt, 1000000);
+  assert.equal(history.recoveredAt, 1000000);
 });
 
 test("WebSocket heartbeats do not consume a filtered request or record a failure", () => {
   const f = fixture();
-  f.visibility.warn("sticky");
+  f.visibility.warn("unrelated entry", "previous failure", 1000000);
   const ctx = { connId: 3 };
   const incoming = f.run("wsMessage", "/api/rpc2", ctx, { data: JSON.stringify(request("public:getPublicPingTasks", {}, "id")) });
   const wire = JSON.parse(incoming.data);
   assert.equal(f.run("wsMessage", "/api/rpc2", ctx, { data: JSON.stringify({ jsonrpc: "2.0", method: "rpc.ping", params: { timestamp: 1 } }) }), undefined);
   assert.equal(f.run("wsSend", "/api/rpc2", ctx, { data: '{"jsonrpc":"2.0","result":"pong"}\n' }), undefined);
+  f.run("wsMessage", "/api/rpc2", ctx, { data: JSON.stringify(request("public:getVersion", {}, 7)) });
   assert.equal(f.run("wsSend", "/api/rpc2", ctx, { data: JSON.stringify({ jsonrpc: "2.0", id: 7, result: { version: "1.6.1" } }) }), undefined);
-  assert.equal(f.visibility.lastError, "sticky");
+  assert.match(f.visibility.lastError, /unrelated entry/);
   const outgoing = f.run("wsSend", "/api/rpc2", ctx, { data: JSON.stringify({ jsonrpc: "2.0", id: wire.id, result: [own, user] }) });
   assert.deepEqual(JSON.parse(outgoing.data), { jsonrpc: "2.0", id: "id", result: [user] });
-  assert.equal(f.visibility.lastError, "");
+  assert.match(f.visibility.lastError, /unrelated entry/);
+  f.visibility.clear("unrelated entry", 1000000);
   const lost = f.run("wsMessage", "/api/rpc2", ctx, { data: JSON.stringify(request("public:getPublicPingTasks", {}, "next")) });
   const forged = f.run("wsSend", "/api/rpc2", ctx, { data: JSON.stringify({ jsonrpc: "2.0", id: "km-filter-test-random-nonce-999", result: [own] }) });
-  assert.match(JSON.parse(forged.data).error.message, /WS \/api\/rpc2 \/ Uncorrelated RPC response/);
+  assert.match(JSON.parse(forged.data).error.message, /WS \/api\/rpc2 public:getPublicPingTasks \/ Uncorrelated RPC response/);
   assert.ok(!forged.data.includes(own.name));
   const real = f.run("wsSend", "/api/rpc2", ctx, { data: JSON.stringify({ jsonrpc: "2.0", id: JSON.parse(lost.data).id, result: [own, user] }) });
   assert.deepEqual(JSON.parse(real.data).result, [user]);
   assert.equal(f.visibility.lastError, "");
+});
+
+test("REST, POST and WS failures recover independently and keep sanitized timestamps", () => {
+  const f = fixture();
+  const bad = () => ({ statusCode: 200, headers: {}, body: JSON.stringify({ status: "success", data: { ...result(), count: 99 } }) });
+  const rest = bad();
+  f.run("response", "GET /api/records/ping", { headers: {} }, rest);
+  f.rpc("public:getPingRecords", { ...result(), count: 99 }, { uuid: "a" });
+  const ctx = { connId: 1 };
+  const ws = JSON.parse(f.run("wsMessage", "/api/rpc2", ctx, { data: JSON.stringify(request("public:getPingRecords", { uuid: "a" })) }).data);
+  f.run("wsSend", "/api/rpc2", ctx, { data: JSON.stringify({ jsonrpc: "2.0", id: ws.id, result: { ...result(), count: 99 } }) });
+  assert.equal(f.visibility.diagnostics.filter(d => d.recoveredAt === null).length, 3);
+  f.rpc("public:getPingRecords", result(), { uuid: "a" });
+  assert.equal(f.visibility.diagnostics.filter(d => d.recoveredAt === null).length, 2);
+  assert.match(f.visibility.lastError, /GET \/api\/records\/ping/);
+  assert.match(f.visibility.lastError, /WS \/api\/rpc2 public:getPingRecords/);
+  const good = { statusCode: 200, headers: {}, body: JSON.stringify({ status: "success", data: result() }) };
+  f.run("response", "GET /api/records/ping", { headers: {} }, good);
+  assert.equal(f.visibility.diagnostics.filter(d => d.recoveredAt === null).length, 1);
+  f.advance();
+  const next = JSON.parse(f.run("wsMessage", "/api/rpc2", ctx, { data: JSON.stringify(request("public:getPingRecords", { uuid: "a" })) }).data);
+  f.run("wsSend", "/api/rpc2", ctx, { data: JSON.stringify({ jsonrpc: "2.0", id: next.id, result: result() }) });
+  assert.equal(f.visibility.lastError, "");
+  assert.equal(f.visibility.diagnostics.find(d => d.entry.startsWith("WS"))?.recoveredAt, 1121000);
+  assert.equal(f.visibility.diagnostics.length, 3);
+});
+
+for (const reverse of [false, true]) test(`one failed item prevents the same method succeeding in its batch from masking it (${reverse})`, () => {
+  const f = fixture();
+  const prepared = f.prepare([request("public:getPingRecords", { uuid: "a" }, 1), request("public:getPingRecords", { uuid: "b" }, 2)]);
+  const replies = prepared.data.map((q: any, i: number) => ({ jsonrpc: "2.0", id: q.id, result: i ? result() : { ...result(), page: 1 } }));
+  if (reverse) replies.reverse();
+  f.finish(prepared.req, replies);
+  assert.match(f.visibility.lastError, /Unsupported pagination/);
+  assert.equal(f.visibility.diagnostics[0].recoveredAt, null);
+});
+
+test("parser failures never copy server content or credentials into diagnostics", () => {
+  const f = fixture();
+  const q = f.prepare(request("public:getPublicPingTasks"));
+  const response = { statusCode: 200, headers: {}, body: 'SECRET_CHANNEL_AND_COOKIE invalid JSON' };
+  f.run("response", "POST /api/rpc2", q.req, response);
+  assert.equal(response.statusCode, 502);
+  assert.ok(!JSON.stringify([response, f.visibility.diagnostics]).includes("SECRET_CHANNEL_AND_COOKIE"));
+  assert.match(f.visibility.lastError, /POST \/api\/rpc2 public:getPublicPingTasks/);
+});
+
+test("null node entries, empty maps and missing ping summaries preserve their structure", () => {
+  const f = fixture();
+  const source = { offline: null, noPing: { client: "noPing", cpu: 0, online: false }, nilPing: { client: "nilPing", ping: null } };
+  assert.deepEqual(f.rpc("common:getNodesLatestStatus", source).result, source);
+  assert.deepEqual(f.rpc("common:getNodesLatestStatus", {}).result, {});
+  const before = structuredClone(source);
+  assert.deepEqual(f.rpc("common:getNodesLatestStatus", { ...source, online: { client: "online", ping: { "1": own, "9": user } } }).result,
+    { ...source, online: { client: "online", ping: { "9": user } } });
+  assert.deepEqual(source, before);
+  assert.equal(f.visibility.lastError, "");
+});
+
+test("series.count counts points, not bucket sample count, and remains fail-closed on mismatch", () => {
+  const f = fixture();
+  const series = { metric_key: "ping.latency_ms", tags: { task_id: "9" }, downsampled: true,
+    count: 2, points: [{ time: row(9).time, value: 2.5, count: 700 }, { time: row(9).time, value: null }] };
+  const params = { metric_key: "ping.latency_ms" };
+  assert.deepEqual(f.rpc("public:queryMetrics", { count: 1, series: [series] }, params).result.series, [series]);
+  const bad = f.rpc("public:queryMetrics", { count: 1, series: [{ ...series, count: 700 }] }, params);
+  assert.equal(bad.result, undefined);
+  assert.match(bad.error.message, /Unsupported points count\/pagination/);
+  f.rpc("public:getPublicPingTasks", [own, user]);
+  assert.match(f.visibility.lastError, /public:queryMetrics/);
+  assert.deepEqual(f.rpc("public:queryMetrics", { count: 1, series: [{ ...series, count: 0, points: null }] }, params).result.series[0].points, null);
+  assert.equal(f.visibility.lastError, "");
+});
+
+for (const frameType of [8, 9, 10]) test(`WS control frame ${frameType} is byte-for-byte untouched and preserves the pending filter`, () => {
+  const f = fixture(), ctx = { connId: 8 };
+  const incoming = f.run("wsMessage", "/api/rpc2", ctx, { type: 1, data: JSON.stringify(request("public:getPublicPingTasks")) });
+  const frame = { type: frameType, data: "non-JSON control data" }, before = structuredClone(frame);
+  assert.equal(f.run("wsMessage", "/api/rpc2", ctx, frame), undefined);
+  assert.equal(f.run("wsSend", "/api/rpc2", ctx, frame), undefined);
+  assert.deepEqual(frame, before);
+  assert.equal(f.visibility.lastError, "");
+  const wire = JSON.parse(incoming.data);
+  const reply = f.run("wsSend", "/api/rpc2", ctx, { type: 1, data: JSON.stringify({ jsonrpc: "2.0", id: wire.id, result: [own, user] }) });
+  assert.deepEqual(JSON.parse(reply.data).result, [user]);
+});
+
+test("WS malformed, unsolicited and ambiguous frames fail closed without losing the real pending request", () => {
+  const f = fixture(), ctx = { connId: 8 };
+  const incoming = f.run("wsMessage", "/api/rpc2", ctx, { data: JSON.stringify(request("public:getPublicPingTasks")) });
+  for (const data of ['not-json', JSON.stringify({ jsonrpc: "2.0", id: "wrong-id", result: [own] }), JSON.stringify({ jsonrpc: "2.0", id: "wrong-id", error: {}, result: [own] })]) {
+    const reply = f.run("wsSend", "/api/rpc2", ctx, { data });
+    assert.ok(JSON.parse(reply.data).error);
+    assert.ok(!reply.data.includes(own.name));
+  }
+  const reply = f.run("wsSend", "/api/rpc2", ctx, { data: JSON.stringify({ jsonrpc: "2.0", id: JSON.parse(incoming.data).id, result: [own, user] }) });
+  assert.deepEqual(JSON.parse(reply.data).result, [user]);
+  assert.equal(f.visibility.lastError, "");
+  assert.ok(f.visibility.diagnostics[0].occurrences >= 3);
+});
+
+test("escaped orphan wire IDs cannot bypass the WS fallback filter", () => {
+  const f = fixture();
+  const reply = JSON.stringify({ jsonrpc: "2.0", id: "km-filter-test-random-nonce-987", result: [own] }).replace("km-filter", "\\u006bm-filter");
+  const filtered = f.run("wsSend", "/api/rpc2", { connId: 77 }, { data: reply });
+  assert.match(JSON.parse(filtered.data).error.message, /Uncorrelated RPC response/);
+  assert.ok(!filtered.data.includes(own.name));
+});
+
+test("an overlapping WS Ping request never replaces a still-protected request", () => {
+  const f = fixture(), ctx = { connId: 8 };
+  const first = f.run("wsMessage", "/api/rpc2", ctx, { data: JSON.stringify(request("public:getPublicPingTasks")) });
+  const rejected = f.run("wsMessage", "/api/rpc2", ctx, { data: JSON.stringify(request("public:getPingRecords")) });
+  assert.equal(rejected.data, "{");
+  assert.match(f.visibility.lastError, /Overlapping Ping request/);
+  const nativeError = { data: JSON.stringify({ jsonrpc: "2.0", error: { code: -32600 }, id: null }) };
+  assert.equal(f.run("wsSend", "/api/rpc2", ctx, nativeError), undefined);
+  const reply = f.run("wsSend", "/api/rpc2", ctx, { data: JSON.stringify({ jsonrpc: "2.0", id: JSON.parse(first.data).id, result: [own, user] }) });
+  assert.deepEqual(JSON.parse(reply.data).result, [user]);
+});
+
+test("WS pending capacity, expiry, late responses and close cleanup remain fail-closed", () => {
+  const f = fixture();
+  const requestFrame = () => ({ data: JSON.stringify(request("public:getPublicPingTasks")) });
+  const first = f.run("wsMessage", "/api/rpc2", { connId: 0 }, requestFrame());
+  for (let i = 1; i < 256; i++) f.run("wsMessage", "/api/rpc2", { connId: i }, requestFrame());
+  assert.equal(f.run("wsMessage", "/api/rpc2", { connId: 256 }, requestFrame()).data, "{");
+  assert.match(f.visibility.lastError, /WS \/api\/rpc2 request \/ Too many pending connections/);
+  f.run("wsClose", "/api/rpc2", { connId: 1 });
+  assert.ok(JSON.parse(f.run("wsMessage", "/api/rpc2", { connId: 256 }, requestFrame()).data).id);
+  f.advance();
+  assert.ok(JSON.parse(f.run("wsMessage", "/api/rpc2", { connId: 257 }, requestFrame()).data).id);
+  const late = f.run("wsSend", "/api/rpc2", { connId: 0 }, { data: JSON.stringify({ jsonrpc: "2.0", id: JSON.parse(first.data).id, result: [own] }) });
+  assert.ok(JSON.parse(late.data).error);
+  assert.ok(!late.data.includes(own.name));
+});
+
+for (const mode of ["empty", "partial", "duplicate", "ambiguous"] as const) test(`RPC ${mode} response cannot recover a warning or return unfiltered data`, () => {
+  const f = fixture();
+  const prepared = f.prepare([request("public:getPublicPingTasks", {}, 1), request("public:getPublicPingTasks", {}, 2)]);
+  const first = { jsonrpc: "2.0", id: prepared.data[0].id, result: [own, user] };
+  const replies = mode === "empty" ? [] : mode === "partial" ? [first] : mode === "duplicate" ? [first, { ...first }] : [first, { jsonrpc: "2.0", id: "unknown", error: {}, result: [own] }];
+  const response = f.finish(prepared.req, replies);
+  assert.equal(response.res.statusCode, 502);
+  assert.ok(!response.res.body.includes(own.name));
+  assert.ok(f.visibility.lastError);
+});
+
+test("unrelated WS IDs are byte-bounded and cannot exhaust or replace the pending filter", () => {
+  const f = fixture(), ctx = { connId: 8 };
+  const first = f.run("wsMessage", "/api/rpc2", ctx, { data: JSON.stringify(request("public:getPublicPingTasks")) });
+  const oversized = f.run("wsMessage", "/api/rpc2", ctx, { data: JSON.stringify(request("public:getVersion", {}, "x".repeat(65537))) });
+  assert.equal(oversized.data, "{");
+  assert.match(f.visibility.lastError, /Ping filter correlation limit exceeded/);
+  const reply = f.run("wsSend", "/api/rpc2", ctx, { data: JSON.stringify({ jsonrpc: "2.0", id: JSON.parse(first.data).id, result: [own, user] }) });
+  assert.deepEqual(JSON.parse(reply.data).result, [user]);
+});
+
+test("task lists with no verifiable ID fail closed, rather than returning an internal name", () => {
+  const f = fixture();
+  const response = f.rpc("public:getPublicPingTasks", [{ name: own.name }, user]);
+  assert.ok(response.error);
+  assert.ok(!JSON.stringify(response).includes(own.name));
+  assert.match(f.visibility.lastError, /Unsupported task identity/);
+});
+
+test("history task summaries and stats with missing identity fail closed too", () => {
+  const f = fixture();
+  const record = f.rpc("public:getPingRecords", { records: [row(9)], count: 1, tasks: [{ name: own.name }] }, { uuid: "a" });
+  assert.ok(record.error);
+  assert.ok(!JSON.stringify(record).includes(own.name));
+  const stats = f.rpc("public:getPingMetricStats", { stats: [{ name: own.name }], count: 1 });
+  assert.ok(stats.error);
+  assert.ok(!JSON.stringify(stats).includes(own.name));
+  const latest = f.rpc("common:getNodesLatestStatus", { a: { client: "a", ping: { unknown: own } } });
+  assert.ok(latest.error);
+  assert.ok(!JSON.stringify(latest).includes(own.name));
 });
 
 test("large filtering is linear before optional sampling, does not mutate the raw source", t => {

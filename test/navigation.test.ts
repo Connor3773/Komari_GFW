@@ -77,5 +77,5 @@ test("manifest declares the minimum host version and approved hook permission", 
   assert.equal(manifest.komari, ">=1.6.1");
   assert.equal(manifest.permissions.allowHooks, true);
   assert.equal(manifest.short, "komari-gfw");
-  assert.equal(manifest.version, "0.1.7");
+  assert.equal(manifest.version, "0.1.8");
 });

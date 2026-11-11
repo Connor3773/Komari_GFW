@@ -12,6 +12,7 @@
   <main>
     <header class="page-head"><div><p class="eyebrow">KOMARI / BLOCK DETECTION</p><h1>被墙检测配置</h1><p class="subtitle">使用下方“保存配置”应用更改；查看状态请打开后台菜单中的“被墙检测总览”。</p></div></header>
     <div id="message" class="message" role="status" hidden></div>
+    <details id="visibility-diagnostics" class="panel" hidden><summary class="panel-head">最近过滤诊断（本次运行）</summary><div id="visibility-failures" class="note"></div></details>
     <div id="selection-notice" class="message" role="status" hidden></div>
     <form id="settings-form">
       <fieldset id="settings-fields" disabled>
@@ -28,7 +29,7 @@
         <div class="save-bar"><span id="dirty" class="muted">配置已加载</span><button id="save" class="button" type="submit">保存配置</button></div>
       </fieldset>
     </form>
-    <footer>配置和状态仅管理员可见。隐藏不等于访问隔离：Upgrade 请求头可旁路 HTTP 钩子，超大响应、超时或插件禁用也可能透传。<span>被墙检测 0.1.7</span></footer>
+    <footer>配置和状态仅管理员可见。隐藏不等于访问隔离：Upgrade 请求头可旁路 HTTP 钩子，超大响应、超时或插件禁用也可能透传。<span>被墙检测 0.1.8</span></footer>
   </main>
 </body>
 </html>
