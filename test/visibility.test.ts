@@ -269,6 +269,45 @@ test("native RPC and REST errors are preserved, including their IDs", () => {
   assert.equal(res.body, '{"status":"error","message":"login"}');
 });
 
+test("host rejections before the RPC handler keep their native reply and are not filter failures", () => {
+  const f = fixture();
+  const send = (statusCode: number, body: string, method = "common:getNodesLatestStatus") => {
+    const { req, data } = f.prepare(request(method, {}, 5));
+    const res: HookResponse = { statusCode, headers: { etag: "native", "content-length": "9" }, body: body.replace("WIRE", data.id) };
+    f.run("response", "POST /api/rpc2", { ...req, body: "" }, res);
+    return res;
+  };
+  // A private site answers guests from middleware; a recovered panic is an empty 500.
+  const privateSite = '{"status":"error","message":"Private site is enabled, please login first."}';
+  for (const [statusCode, body] of [[401, privateSite], [500, ""], [503, "<html>upstream</html>"]] as const) {
+    assert.deepEqual(send(statusCode, body), { statusCode, headers: { etag: "native", "content-length": "9" }, body });
+  }
+  const failures = () => f.visibility.diagnostics.map(item => item.occurrences);
+  assert.equal(f.visibility.lastError, "");
+  assert.deepEqual(failures(), []);
+  // The native JSON-RPC parse error (400) is still an RPC envelope and passes as before.
+  assert.deepEqual(JSON.parse(send(400, '{"jsonrpc":"2.0","error":{"code":-32700,"message":"invalid json"}}').body).error.code, -32700);
+  assert.deepEqual(failures(), []);
+  // A rejection is not a success: it cannot recover a real failure of the same method.
+  assert.equal(send(200, privateSite).statusCode, 502);
+  assert.match(f.visibility.lastError, /POST \/api\/rpc2 common:getNodesLatestStatus \/ Unsupported RPC envelope/);
+  send(401, privateSite);
+  assert.ok(f.visibility.lastError);
+  send(200, '{"jsonrpc":"2.0","id":"WIRE","result":{}}');
+  assert.equal(f.visibility.lastError, "");
+  assert.deepEqual(failures(), [1]);
+  // Status alone never waves data through: RPC results are filtered, unknown wrappers rejected.
+  const filtered = send(500, JSON.stringify({ jsonrpc: "2.0", id: "WIRE", result: [own, user] }), "public:getPublicPingTasks");
+  assert.deepEqual(JSON.parse(filtered.body), { jsonrpc: "2.0", id: 5, result: [user] });
+  const wrapped = send(500, JSON.stringify({ result: [own] }), "public:getPublicPingTasks");
+  assert.equal(wrapped.statusCode, 502);
+  assert.ok(!wrapped.body.includes(own.name));
+  // A lost REST correlation on a native error keeps the native error as well.
+  const rest = { statusCode: 401, headers: {}, body: privateSite };
+  f.run("response", "GET /api/records/ping", { headers: { "x-komari-gfw-filter": "expired" } }, rest);
+  assert.deepEqual([rest.statusCode, rest.body], [401, privateSite]);
+});
+
 test("unknown pagination/count shapes produce explicit errors, not leaked data or fabricated totals", () => {
   const f = fixture();
   for (const changed of [{ ...result(), total: 200 }, { ...result(), count: 50 }, { ...result(), next_cursor: "cursor" }]) {

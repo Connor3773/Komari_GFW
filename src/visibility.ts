@@ -226,7 +226,7 @@ const MAX_PENDING = 256;
 const MAX_BATCH = 1000;
 const TTL = 120000;
 // Never expose JSON parser excerpts or a raw response in administrator diagnostics.
-const CHECKS = new Set(["Unsupported list", "Unsupported records count/pagination", "Unsupported series count/pagination",
+export const CHECKS = new Set(["Unsupported list", "Unsupported records count/pagination", "Unsupported series count/pagination",
   "Unsupported points count/pagination", "Unsupported stats count/pagination", "Unsupported pagination", "Unsupported result",
   "Unsupported ping record", "Unsupported task identity", "Unsupported metric key", "Unsupported node ping summary", "Unsupported node map",
   "Ambiguous duplicate JSON key", "Ping filter batch limit exceeded", "Ping filter correlation limit exceeded",
@@ -253,6 +253,17 @@ function uniqueKeys(body: string): void {
       top.key = false;
     }
   }
+}
+
+// Host middleware can answer before the RPC handler runs: a private site returns
+// 401 {"status":"error"} to guests, and a recovered panic returns an empty 500.
+// Such a reply carries no RPC result, so it is neither a filter failure nor a
+// success. Anything that still looks like JSON-RPC stays on the fail-closed path.
+function hostRejected(res: HookResponse): boolean {
+  if (res.statusCode >= 200 && res.statusCode < 300) return false;
+  let data: unknown;
+  try { data = JSON.parse(res.body); } catch { return true; }
+  return !(Array.isArray(data) ? data : [data]).some(message => object(message) && ("jsonrpc" in message || "result" in message));
 }
 
 export class PingResponseFilter {
@@ -392,7 +403,7 @@ export class PingResponseFilter {
     });
     server.hook("response", "GET /api/records/ping", (req: HookRequest, res: HookResponse) => {
       const entry = this.take(req);
-      if (req.headers[HEADER] && !entry) { this.headers(res); return this.fail(res, "GET /api/records/ping", "Uncorrelated RPC response"); }
+      if (req.headers[HEADER] && !entry && res.statusCode >= 200 && res.statusCode < 300) { this.headers(res); return this.fail(res, "GET /api/records/ping", "Uncorrelated RPC response"); }
       this.rest(res, entry ? [...entry.selections.values()][0] : { kind: "records", method: "public:getPingRecords" }, "GET /api/records/ping");
     });
     server.hook("request", "POST /api/rpc2", (req: HookRequest) => {
@@ -408,6 +419,8 @@ export class PingResponseFilter {
     server.hook("response", "POST /api/rpc2", (req: HookRequest, res: HookResponse) => {
       if (!req.headers[HEADER]) return;
       const prepared = this.take(req);
+      // Keep the native status and body: clients rely on 401 to show the login page.
+      if (hostRejected(res)) return;
       this.headers(res);
       if (!prepared) return this.fail(res, "POST /api/rpc2", "Uncorrelated RPC response");
       try { res.body = this.rpcResponse(res.body, prepared, "POST /api/rpc2"); }
