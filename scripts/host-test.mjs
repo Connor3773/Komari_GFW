@@ -15,7 +15,8 @@ import { collectRetiredHistory, RETIRED_PROTECTION_MS } from "../src/retention.t
 const root = resolve(".local");
 await mkdir(root, { recursive: true });
 const work = await mkdtemp(join(root, "host-test-"));
-const binary = resolve(process.env.KOMARI_TEST_BINARY || ".local/komari.exe");
+const binary = resolve(process.env.KOMARI_TEST_BINARY || (process.platform === "win32" ? ".local/komari.exe" : ".local/komari"));
+const browserChannel = process.env.KOMARI_TEST_BROWSER_CHANNEL ?? (process.platform === "win32" ? "msedge" : "");
 const password = `Aa1-${randomBytes(24).toString("hex")}`;
 let child, browser, log = "", base, cookie = "";
 const listeners = [];
@@ -402,7 +403,7 @@ try {
     if (state.enabled) assert.ok(state.rows[0].samples.every(s => s.at !== null));
     console.log(`PASS: public/admin REST, HTTP RPC mixed batches, anonymous/admin text/binary WebSocket, user history/stats and internal samples (${Date.now() - starts} ms)`);
   }
-  browser = await chromium.launch({ channel: "msedge", headless: true });
+  browser = await chromium.launch({ ...(browserChannel ? { channel: browserChannel } : {}), headless: true });
   await verifyVisibility();
   const context = await browser.newContext({ viewport: { width: 1400, height: 1000 }, locale: "zh-CN" });
   await context.addCookies([{ name: "session_token", value: cookie.split("=")[1], url: base }]);
@@ -524,10 +525,34 @@ try {
   await overviewFrame.getByRole("heading", { name: "被墙检测总览", exact: true }).waitFor();
   await overviewFrame.getByRole("cell", { name: /Test overseas/ }).waitFor();
   assert.equal(await overviewFrame.locator("header a, header nav").count(), 0);
-  await overviewFrame.getByRole("columnheader", { name: "正向探针（大陆出发）", exact: true }).waitFor();
+  await overviewFrame.getByRole("columnheader", { name: "正向 · 境内探针 → 服务器", exact: true }).waitFor();
+  // The admin appearance is a host setting, not the OS preference: the embedded page must follow it.
+  const frameTheme = () => overviewFrame.locator("html").evaluate(el => [el.dataset.theme, el.dataset.embedded, getComputedStyle(document.body).backgroundColor]);
+  const hostDark = await page.evaluate(() => !!document.querySelector(".radix-themes")?.classList.contains("dark"));
+  assert.deepEqual(await frameTheme(), [hostDark ? "dark" : "light", "true", "rgba(0, 0, 0, 0)"]);
+  await page.evaluate(dark => { const theme = document.querySelector(".radix-themes"); theme.classList.toggle("dark", !dark); theme.classList.toggle("light", dark); }, hostDark);
+  await waitFor(async () => (await frameTheme())[0] === (hostDark ? "light" : "dark"), "Embedded page follows the host appearance", 6000);
+  await page.evaluate(dark => { const theme = document.querySelector(".radix-themes"); theme.classList.toggle("dark", dark); theme.classList.toggle("light", !dark); }, hostDark);
+  await waitFor(async () => (await frameTheme())[0] === (hostDark ? "dark" : "light"), "Embedded page restores the host appearance", 6000);
   assert.ok(!(await overviewFrame.locator("body").innerText()).includes("203.0.113.25"));
   await page.screenshot({ path: join(root, "overview-desktop.png"), fullPage: true });
   const configPage = page;
+  // A private site rejects guests in host middleware, before the RPC handler runs.
+  // The native 401 must reach the client unchanged and is not a filter failure.
+  await rpc("admin:editSettings", { private_site: true });
+  for (const method of ["common:getNodesLatestStatus", "public:getPublicPingTasks"]) {
+    const guest = await fetch(base + "/api/rpc2", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: {} }) });
+    assert.equal(guest.status, 401, method);
+    const body = await guest.text();
+    assert.equal(JSON.parse(body).status, "error");
+    assert.ok(!body.includes("被墙检测") && !body.includes("[Komari GFW:"));
+  }
+  assert.ok(!JSON.stringify(await rpc("admin:getAllPingTasks")).includes("[Komari GFW:"), "Signed-in requests stay filtered on a private site");
+  const privateState = await plugin("overview");
+  assert.equal(privateState.visibilityError, "");
+  assert.deepEqual(privateState.visibilityDiagnostics, []);
+  await rpc("admin:editSettings", { private_site: false });
+  console.log("PASS: private-site guest rejection keeps its native 401 and records no filter failure");
   // Exercise a real request-hook failure before opening the configuration UI.
   // The host must reject the ambiguous request, never return raw Ping tasks.
   const ambiguous = await fetch(base + "/api/rpc2", { method: "POST", headers: { Cookie: cookie, "Content-Type": "application/json" }, body: '{"jsonrpc":"2.0","id":1,"method":"public:getPublicPingTasks","method":"public:getVersion"}' });
@@ -757,7 +782,7 @@ try {
   for (const task of retiring) assert.deepEqual(await sqlQuery("SELECT id FROM metric_series WHERE tags_hash = ?", [createHash("sha256").update(JSON.stringify({ task_id: String(task.id) })).digest("hex")]), []);
   assert.deepEqual(await sqlQuery("SELECT * FROM metric_series WHERE tags_hash = ?", [createHash("sha256").update(JSON.stringify({ task_id: String(userTask.task_id) })).digest("hex")]), userRows);
   console.log("PASS: real SQLite retired dictionary GC, unfiltered raw verification and user data preservation (accelerated test tombstones)");
-  await writeFile(join(root, "host-test-result.json"), JSON.stringify({ komari: hostVersion, plugin: manifest.version, upgradeFrom: Boolean(process.env.KOMARI_TEST_UPGRADE_FROM), passed: true, checkedAt: new Date().toISOString(), checks: ["ZIP lifecycle", "ACL/CSRF", "raw metrics", "strict 2-observer block/recovery", "reverse/forward/both changes", "Webhook title/direction/redaction/no explanation", "persistence", "owned rollup retention", "public/admin HTTP/WS filtering", "native task/server/selector UI and user CRUD", "user history/statistics", "paused filtering", "observer search", "desktop/mobile UI", "deleted observer switches to basic monitoring", "deleted selection save/reload", "deleted last target stops without false recovery", "cleanup"], limitation: "Synthetic v2 Agents with real loopback TCP, not production geographically distributed Agents; real retention test uses SQLite. Hook limits are not an authorization boundary." }, null, 2));
+  await writeFile(join(root, "host-test-result.json"), JSON.stringify({ komari: hostVersion, plugin: manifest.version, upgradeFrom: Boolean(process.env.KOMARI_TEST_UPGRADE_FROM), passed: true, checkedAt: new Date().toISOString(), checks: ["ZIP lifecycle", "ACL/CSRF", "raw metrics", "strict 2-observer block/recovery", "reverse/forward/both changes", "Webhook title/direction/redaction/no explanation", "persistence", "owned rollup retention", "public/admin HTTP/WS filtering", "native task/server/selector UI and user CRUD", "user history/statistics", "paused filtering", "observer search", "desktop/mobile UI", "host theme follow", "private-site guest 401 passthrough", "deleted observer switches to basic monitoring", "deleted selection save/reload", "deleted last target stops without false recovery", "cleanup"], limitation: "Synthetic v2 Agents with real loopback TCP, not production geographically distributed Agents; real retention test uses SQLite. Hook limits are not an authorization boundary." }, null, 2));
 } catch (error) {
   await writeFile(join(root, "host-test-error.log"), log);
   console.error(error?.stack ?? String(error)); process.exitCode = 1;

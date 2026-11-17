@@ -58,13 +58,27 @@ test("direction copy uses mainland-to-server as forward and server-to-mainland a
   const overview = read("pages/overview.html");
   const settings = read("pages/settings.html");
   const app = read("pages/app.js");
-  assert.match(overview, /正向：大陆探针到受检服务器；反向：受检服务器到大陆目标/);
-  assert.match(settings, /反向：受检服务器到 3 个大陆目标；对照：受检服务器到 2 个非大陆目标/);
-  assert.match(settings, /正向 TCP 探测：大陆探针到受检服务器/);
+  assert.match(overview, /反向：受检服务器 → 大陆目标；正向：境内探针 → 受检服务器/);
+  assert.match(settings, /由受检服务器主动连接。反向：3 个大陆目标；对照：2 个非大陆目标/);
+  assert.match(settings, /由境内探针主动连接受检服务器/);
   assert.match(settings, /解除要求反向 3\/3、非大陆对照 2\/2 和全部正向探针成功/);
-  assert.match(app, /仅反向检测 · 正向全局关闭/);
-  assert.match(app, /正向探针（大陆出发）/);
+  assert.match(app, /监测中 · 仅反向检测/);
+  assert.match(app, /反向 · 服务器 → 大陆目标/);
+  assert.match(app, /正向 · 境内探针 → 服务器/);
   assert.doesNotMatch(overview + settings + app, /境内反向探针|正向 5\/5|基础模式 · 正向检测/);
+});
+
+test("pages apply the host theme before first paint and ship no inline script or style", () => {
+  for (const page of ["overview", "settings"]) {
+    const html = read(`pages/${page}.html`);
+    // A blocking script in <head> sets the theme before the body renders.
+    assert.match(html.match(/<head>[\s\S]*<\/head>/)![0], /<script src="\.\/app\.js"><\/script>/);
+    assert.doesNotMatch(html, /<script(?![^>]*\ssrc=)|\sstyle=|\son\w+=/i);
+  }
+  const app = read("pages/app.js");
+  assert.match(app, /frameElement/);
+  // An observer on host nodes would keep a closed plugin page alive.
+  assert.doesNotMatch(app, /MutationObserver/);
 });
 
 test("manifest and package versions match the page footer", () => {
@@ -77,5 +91,5 @@ test("manifest declares the minimum host version and approved hook permission", 
   assert.equal(manifest.komari, ">=1.6.1");
   assert.equal(manifest.permissions.allowHooks, true);
   assert.equal(manifest.short, "komari-gfw");
-  assert.equal(manifest.version, "0.1.8");
+  assert.equal(manifest.version, "0.1.9");
 });

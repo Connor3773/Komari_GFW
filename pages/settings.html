@@ -6,30 +6,116 @@
   <meta name="color-scheme" content="light dark">
   <title>被墙检测配置</title>
   <link rel="stylesheet" href="./style.css">
-  <script src="./app.js" defer></script>
+  <script src="./app.js"></script>
 </head>
 <body data-page="settings">
   <main>
-    <header class="page-head"><div><p class="eyebrow">KOMARI / BLOCK DETECTION</p><h1>被墙检测配置</h1><p class="subtitle">使用下方“保存配置”应用更改；查看状态请打开后台菜单中的“被墙检测总览”。</p></div></header>
-    <div id="message" class="message" role="status" hidden></div>
-    <details id="visibility-diagnostics" class="panel" hidden><summary class="panel-head">最近过滤诊断（本次运行）</summary><div id="visibility-failures" class="note"></div></details>
-    <div id="selection-notice" class="message" role="status" hidden></div>
+    <header class="page-head">
+      <div>
+        <h1>被墙检测配置</h1>
+        <p class="subtitle">修改后点击底部的“保存配置”生效。检测结果在后台菜单“插件功能 → 被墙检测总览”中查看。</p>
+      </div>
+    </header>
+    <div id="message" class="alert" role="status" hidden></div>
+    <div id="selection-notice" class="alert info" role="status" hidden></div>
     <form id="settings-form">
       <fieldset id="settings-fields" disabled>
-        <section class="panel"><div class="panel-head"><div><h2>监测策略</h2><p class="muted small">改变检测策略会重新采样，尚未解除的告警将保留。</p></div><label class="switch"><input id="enabled" type="checkbox">启用监测</label></div><div class="form-grid">
-          <label>检测间隔（秒）<input id="interval" type="number" min="30" max="300" required></label>
-          <label>告警连续次数<input id="failure" type="number" min="1" max="10" required></label>
-          <label>恢复连续次数<input id="recovery" type="number" min="1" max="10" required></label>
-          <label>非大陆成功条件<select id="overseas"><option value="1">至少 1 个成功</option><option value="2">2 个全部成功</option></select></label>
-        </div><div class="option-row"><label class="switch"><input id="mask" type="checkbox">隐藏服务器 IP 后两段</label><span class="muted small">203.0.*.*，同时作用于通知和总览；IPv6 隐藏后半部分。</span></div></section>
-        <section class="panel"><div class="panel-head"><div><h2>服务器主动探测目标</h2><p class="muted small">反向：受检服务器到 3 个大陆目标；对照：受检服务器到 2 个非大陆目标。支持 域名:端口、IPv4:端口、[IPv6]:端口。</p></div><span class="pill">3 大陆 + 2 非大陆</span></div><div id="targets" class="target-grid"></div><p class="note">域名由每台 Agent 本地解析。DNS 或目标故障也可能造成失败；默认大陆目标均位于广东，不能代表所有地区。</p></section>
-        <section class="panel"><div class="panel-head"><div><h2>正向检测</h2><p class="muted small">正向 TCP 探测：大陆探针到受检服务器。全局与服务器独立开关同时开启才生效。</p></div><label class="switch"><input id="strict" type="checkbox">正向检测全局开关</label></div><div id="strict-options" hidden><h3>境内正向探针</h3><p class="muted small">请自行确认这些服务器在境内且控制通道稳定。不会让服务器探测自己。</p><label class="sr-only" for="observer-search">搜索境内探针</label><input id="observer-search" type="search" placeholder="搜索名称、分组或显示 IP"><div id="observers" class="selection-grid server-selection" role="region" aria-label="境内探针列表" tabindex="0"></div></div><p class="note">实际开启正向检测的服务器区分反向墙、正向墙和双向墙，单向异常及方向变化均连续确认后通知；解除要求反向 3/3、非大陆对照 2/2 和全部正向探针成功。其余服务器仅使用 5 个主动目标判断普通被墙状态，不等待正向结果。</p></section>
-        <section class="panel"><div class="panel-head"><div><h2>监测服务器 <span id="selected-count" class="muted"></span></h2><p class="muted small">先选择受检服务器，再按需开启其正向检测。新选服务器默认不开启正向检测。</p></div><label class="sr-only" for="client-search">搜索服务器</label><input id="client-search" type="search" placeholder="搜索名称、分组或显示 IP"></div><div id="clients" class="client-list server-selection" role="region" aria-label="受检服务器列表" tabindex="0"></div><p class="note">正向检测启用时端口必填；地址可选，手动地址优先，否则使用登记 IPv4，无 IPv4 时使用 IPv6。关闭开关隐藏输入框并保留草稿，重新开启再校验。插件不会启动服务或修改防火墙。</p></section>
-        <section class="panel"><div class="panel-head"><div><h2>通知与维护</h2><p id="notification-status" class="muted small"></p></div><button class="button subtle" id="test-notification" type="button">发送测试通知</button></div><p class="note">沿用系统当前通知渠道，模板必须包含 {{message}}。测试消息不包含服务器信息。</p><p class="note">仅保存最新探测值及必要告警状态；事件保留 7 天、最多 100 条。每小时清理本插件超过 1 小时的已结束聚合记录，保留近期数据和仍在聚合的时间桶，不修改其它任务或全局保留策略。</p><div class="option-row"><button class="button danger" id="cleanup" type="button">清理插件任务</button><span class="muted small">先保存关闭监测，再清理。删除本插件任务及探测历史，不影响其它任务。</span></div></section>
-        <div class="save-bar"><span id="dirty" class="muted">配置已加载</span><button id="save" class="button" type="submit">保存配置</button></div>
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>监测策略</h2>
+              <p>修改策略后会重新采样；尚未解除的告警保持不变。</p>
+            </div>
+            <label class="switch"><input id="enabled" class="toggle" type="checkbox">启用监测</label>
+          </div>
+          <div class="form-grid">
+            <label class="field">检测间隔（秒）<input id="interval" type="number" min="30" max="300" required><small>30 – 300</small></label>
+            <label class="field">告警确认次数<input id="failure" type="number" min="1" max="10" required><small>连续异常几轮后告警</small></label>
+            <label class="field">恢复确认次数<input id="recovery" type="number" min="1" max="10" required><small>连续正常几轮后解除</small></label>
+            <label class="field">非大陆对照要求<select id="overseas"><option value="1">至少 1 个可达</option><option value="2">2 个全部可达</option></select><small>满足后才判定为疑似被墙</small></label>
+          </div>
+          <div class="option-row">
+            <label class="switch"><input id="mask" class="toggle" type="checkbox">隐藏服务器 IP 后两段</label>
+            <span class="muted">通知和总览中显示为 203.0.*.*；IPv6 隐藏后半部分。</span>
+          </div>
+        </section>
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>探测目标</h2>
+              <p>由受检服务器主动连接。反向：3 个大陆目标；对照：2 个非大陆目标。</p>
+            </div>
+          </div>
+          <div id="targets" class="target-grid"></div>
+          <p class="note">地址格式为 域名:端口、IPv4:端口 或 [IPv6]:端口。域名由各服务器的 Agent 在本地解析，DNS 或目标自身故障同样会导致探测失败。默认的大陆目标都在广东，不能代表所有地区。</p>
+        </section>
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>正向检测</h2>
+              <p>由境内探针主动连接受检服务器，用来区分反向墙、正向墙和双向墙。需要同时打开这里的全局开关和服务器自己的开关。</p>
+            </div>
+            <label class="switch"><input id="strict" class="toggle" type="checkbox" aria-label="正向检测全局开关">全局启用</label>
+          </div>
+          <div id="strict-options" hidden>
+            <div class="tools">
+              <h3>境内探针 <span id="observer-count" class="count muted"></span></h3>
+              <label class="sr-only" for="observer-search">搜索境内探针</label>
+              <input id="observer-search" type="search" placeholder="搜索名称、分组或 IP">
+            </div>
+            <p>选择位于境内、控制通道稳定的服务器，最多 20 台。探针不会探测自己。</p>
+            <div id="observers" class="selection-grid server-selection" role="region" aria-label="境内探针列表" tabindex="0"></div>
+          </div>
+          <p class="note">开启正向检测的服务器，单向异常和方向变化都会在连续确认后通知；解除要求反向 3/3、非大陆对照 2/2 和全部正向探针成功。其余服务器只按 5 个探测目标判断是否疑似被墙，不等待正向结果。</p>
+        </section>
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>受检服务器 <span id="selected-count" class="count"></span></h2>
+              <p>勾选需要检测的服务器。Komari 中新增的服务器不会自动加入。</p>
+            </div>
+            <div class="tools">
+              <button id="select-all" class="button ghost" type="button">全选</button>
+              <button id="select-none" class="button ghost" type="button">全不选</button>
+              <label class="sr-only" for="client-search">搜索服务器</label>
+              <input id="client-search" type="search" placeholder="搜索名称、分组或 IP">
+            </div>
+          </div>
+          <div id="clients" class="client-list server-selection" role="region" aria-label="受检服务器列表" tabindex="0"></div>
+          <p id="forward-hint" class="note" hidden>测试端口必填，需是服务器上实际开放的 TCP 端口。测试地址留空时使用登记的 IPv4，没有 IPv4 则使用 IPv6。关闭开关只隐藏输入框，已填内容会保留。插件不会启动服务，也不会修改防火墙。</p>
+        </section>
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>通知与维护</h2>
+              <p id="notification-status"></p>
+            </div>
+            <button class="button subtle" id="test-notification" type="button">发送测试通知</button>
+          </div>
+          <p class="note">使用 Komari 当前的通知渠道，通知模板需要包含 {{message}}。测试消息不含服务器信息。</p>
+          <p class="note">插件只保存最新探测值和必要的告警状态；状态变更保留 7 天、最多 100 条。每小时清理一次本插件超过 1 小时的聚合记录，不影响其它任务和全局保留策略。</p>
+          <div class="option-row">
+            <button class="button danger" id="cleanup" type="button">清理插件任务</button>
+            <span class="muted">删除本插件创建的探测任务及其探测历史，不影响其它任务。需要先关闭监测并保存。</span>
+          </div>
+        </section>
+        <div class="save-bar">
+          <div id="feedback" class="alert" role="status" hidden></div>
+          <span id="dirty" class="state">正在加载配置</span>
+          <button id="discard" class="button subtle" type="button" hidden>放弃更改</button>
+          <button id="save" class="button" type="submit">保存配置</button>
+        </div>
       </fieldset>
     </form>
-    <footer>配置和状态仅管理员可见。隐藏不等于访问隔离：Upgrade 请求头可旁路 HTTP 钩子，超大响应、超时或插件禁用也可能透传。<span>被墙检测 0.1.8</span></footer>
+    <details id="visibility-diagnostics" class="panel" hidden>
+      <summary>接口过滤诊断 <span id="visibility-count" class="pill plain"></span></summary>
+      <p class="note">插件会把自己创建的探测任务从 Komari 的延迟监测界面和接口中隐藏。这里列出本次运行中无法安全过滤、因而被拦截的响应；插件重启后清空。</p>
+      <div id="visibility-failures"></div>
+    </details>
+    <footer>
+      <span>配置和检测结果仅管理员可见。任务隐藏属于展示层过滤，不是访问隔离。</span>
+      <span>被墙检测 0.1.9</span>
+    </footer>
   </main>
 </body>
 </html>

@@ -6,23 +6,67 @@
   <meta name="color-scheme" content="light dark">
   <title>被墙检测总览</title>
   <link rel="stylesheet" href="./style.css">
-  <script src="./app.js" defer></script>
+  <script src="./app.js"></script>
 </head>
 <body data-page="overview">
   <main>
-    <header class="page-head"><div><p class="eyebrow">KOMARI / BLOCK DETECTION</p><h1>被墙检测总览</h1><p class="subtitle">正向：大陆探针到受检服务器；反向：受检服务器到大陆目标。非大陆目标作为连通性对照。</p></div></header>
-    <div id="message" class="message" role="status" hidden></div>
-    <details id="visibility-diagnostics" class="panel" hidden><summary class="panel-head">最近过滤诊断（本次运行）</summary><div id="visibility-failures" class="note"></div></details>
-    <div id="selection-notice" class="message" role="status" hidden></div>
-    <section class="status-strip" aria-label="运行情况"><span id="mode" class="pill">正在加载</span><span id="schedule"></span><span id="last-poll" class="muted"></span><button id="refresh" class="button subtle" type="button">刷新结果</button></section>
-    <section id="stats" class="stats" aria-label="状态统计"></section>
-    <section class="panel">
-      <div class="panel-head"><div><h2>服务器状态</h2><p class="muted small">疑似被墙为连通性推断，不代表封锁原因已确证。</p></div><div class="filters"><label class="sr-only" for="search">搜索服务器</label><input id="search" type="search" placeholder="搜索名称、分组或显示 IP"><label class="sr-only" for="filter">筛选状态</label><select id="filter"><option value="all">全部状态</option><option value="alarm">未解除告警</option><option value="healthy">正常</option><option value="abnormal">异常 / 待确认</option><option value="unknown">数据不足</option></select></div></div>
-      <div class="table-wrap"><table><thead id="matrix-head"></thead><tbody id="matrix"></tbody></table></div>
-      <div id="empty" class="empty" hidden><h3>还没有监测数据</h3><p>选择服务器并开启监测后，结果会在这里汇集。</p><a class="button" href="/admin/plugins/config?short=komari-gfw" target="_blank" rel="noopener">配置监测</a></div>
+    <header class="page-head">
+      <div>
+        <h1>被墙检测总览</h1>
+        <p class="subtitle">反向：受检服务器 → 大陆目标；正向：境内探针 → 受检服务器；非大陆目标用作连通性对照。</p>
+      </div>
+      <div class="head-actions">
+        <span id="last-poll" class="muted small"></span>
+        <button id="refresh" class="button subtle" type="button">刷新</button>
+      </div>
+    </header>
+    <div id="message" class="alert" role="status" hidden></div>
+    <div id="selection-notice" class="alert info" role="status" hidden></div>
+    <section class="summary" aria-label="运行情况">
+      <span id="mode" class="pill">正在加载</span>
+      <span id="schedule"></span>
+      <span id="notification-status"></span>
     </section>
-    <section class="panel"><div class="panel-head"><div><h2>状态变更与通知</h2><p id="notification-status" class="muted small"></p></div><span class="muted small">最近 7 天，最多 100 条</span></div><div id="events" class="event-list"></div></section>
-    <footer>只使用新鲜、完整的探测结果。离线或缺失上报不视为连接失败。接口隐藏并非严格数据隔离，超大响应及插件禁用时存在透传限制。<span>被墙检测 0.1.8</span></footer>
+    <section id="stats" class="stats" aria-label="按状态筛选"></section>
+    <section class="panel">
+      <div class="panel-head">
+        <div>
+          <h2>服务器状态</h2>
+          <p>“疑似被墙”是根据 TCP 连通性做出的推断，不代表已确认封锁原因。</p>
+        </div>
+        <label class="sr-only" for="search">搜索服务器</label>
+        <input id="search" type="search" placeholder="搜索名称、分组或 IP">
+      </div>
+      <div class="table-wrap">
+        <table role="table" aria-label="服务器探测结果">
+          <thead id="matrix-head" role="rowgroup"></thead>
+          <tbody id="matrix" role="rowgroup"></tbody>
+        </table>
+      </div>
+      <div id="empty" class="empty" hidden>
+        <h3>还没有受检服务器</h3>
+        <p>选择服务器并启用监测后，探测结果会显示在这里。</p>
+        <a class="button" href="/admin/plugins/config?short=komari-gfw" target="_blank" rel="noopener">前往配置</a>
+      </div>
+    </section>
+    <section class="panel">
+      <div class="panel-head">
+        <div>
+          <h2>状态变更与通知</h2>
+          <p>保留最近 7 天，最多 100 条。</p>
+        </div>
+      </div>
+      <div id="events" class="event-list"></div>
+    </section>
+    <details id="visibility-diagnostics" class="panel" hidden>
+      <summary>接口过滤诊断 <span id="visibility-count" class="pill plain"></span></summary>
+      <p class="note">插件会把自己创建的探测任务从 Komari 的延迟监测界面和接口中隐藏。这里列出本次运行中无法安全过滤、因而被拦截的响应；插件重启后清空。</p>
+      <div id="visibility-failures"></div>
+    </details>
+    <footer>
+      <span>只采用新鲜且完整的探测结果；服务器离线或上报缺失不计为连接失败。</span>
+      <span>被墙检测 0.1.9</span>
+    </footer>
   </main>
 </body>
 </html>
